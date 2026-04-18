@@ -9,5 +9,5 @@ Single-binary service discovery sidecar for multi-agent systems.
 """
 
 __version__ = "1.0.0"
-__author__  = "agentns contributors"
+__author__  = "DataWorksAI"
 __license__ = "MIT"

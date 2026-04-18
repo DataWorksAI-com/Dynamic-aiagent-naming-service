@@ -51,7 +51,7 @@ Three things happen automatically, with zero code changes to your agents:
 
 ```bash
 # Start agentns
-docker run -p 8200:8200 ghcr.io/manikandan-dataworks/agentns:latest
+docker run -p 8200:8200 ghcr.io/DataWorksAI-com/agentns:latest
 
 # Register an agent
 curl -X POST http://localhost:8200/register \
@@ -440,7 +440,7 @@ One shared agentns for the whole system. Use MongoDB to persist registrations.
 # docker-compose.yml
 services:
   agentns:
-    image: ghcr.io/manikandan-dataworks/agentns:latest
+    image: ghcr.io/DataWorksAI-com/agentns:latest
     ports: ["8200:8200"]
     environment:
       MONGODB_URI: "mongodb+srv://..."
@@ -473,4 +473,4 @@ pytest tests/ -v
 
 ## License
 
-MIT © 2025 Manikandan Meenakshisundaram
+MIT © 2025 DataWorksAI

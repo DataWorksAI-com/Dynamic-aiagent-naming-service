@@ -8,6 +8,7 @@ version     = "1.0.0"
 description = "Single-binary service discovery sidecar for multi-agent systems"
 readme      = "README.md"
 license     = { text = "MIT" }
+authors     = [{name = "DataWorksAI", email = "contact@dataworksai.com"}]
 requires-python = ">=3.10"
 
 keywords = [
@@ -45,9 +46,9 @@ dev   = [
 ]
 
 [project.urls]
-Homepage      = "https://github.com/manikandan-dataworks/agentns"
-Documentation = "https://github.com/manikandan-dataworks/agentns#readme"
-"Bug Tracker" = "https://github.com/manikandan-dataworks/agentns/issues"
+Homepage      = "https://github.com/DataWorksAI-com/agentns"
+Documentation = "https://github.com/DataWorksAI-com/agentns#readme"
+"Bug Tracker" = "https://github.com/DataWorksAI-com/agentns/issues"
 
 [project.scripts]
 agentns-server = "agentns.server:main"
