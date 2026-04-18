@@ -31,7 +31,6 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-import sys
 import time as _time
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -39,13 +38,12 @@ from typing import Any, Dict, List, Optional
 
 import uvicorn
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import JSONResponse
 
 from .cache            import ResolutionCache
 from .geocoder         import resolve_city, geocode_cache_snapshot
 from .health_checker   import check_agent_health, probe_endpoint
 from .server_selection import rank_servers, select_protocol, calculate_ttl
-from .urn_parser       import parse_urn, build_urn, extract_label
+from .urn_parser       import parse_urn, build_urn
 
 # ── logging ────────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -174,7 +172,7 @@ def _cached_health(endpoint_url: str) -> Dict:
     return _health_cache.get(endpoint_url, {
         "status":           "unknown",
         "load":             50.0,
-        "response_time_ms": 0.0,
+        "response_time_ms": 9999.0,
         "last_check":       None,
     })
 
@@ -338,7 +336,7 @@ async def resolve(body: dict):
             {
                 "endpoint":   s["endpoint"],
                 "region":     s["region_label"] or s["region"],
-                "flag":       s["flag"],
+                "flag":       s.get("flag", ""),
                 "status":     health_map[s["server_id"]].get("status", "unknown"),
                 "latency_ms": round(health_map[s["server_id"]].get("response_time_ms", 0.0), 1),
                 "load":       health_map[s["server_id"]].get("load", 50.0),
@@ -356,7 +354,8 @@ async def resolve(body: dict):
             "endpoint":     ep["endpoint"],
             "protocol":     protocol,
             "ttl":          5,
-            "region":       ep["region_label"] or ep["region"],
+            "region":       ep.get("region_label") or ep.get("region", ""),
+            "flag":         ep.get("flag", ""),
             "cached":       False,
             "selected_by":  "emergency_fallback",
             "resolution_time_ms": round((_time.monotonic() - t0) * 1000, 1),
@@ -504,7 +503,7 @@ async def register(body: dict):
 # ── DELETE /register/{label} ───────────────────────────────────────────────────
 
 @app.delete("/register/{label}")
-async def deregister(label: str, body: dict = None):
+async def deregister(label: str, body: Optional[Dict] = None):
     """
     Deregister one or all endpoints for *label*.
 
@@ -527,15 +526,15 @@ async def deregister(label: str, body: dict = None):
         if _mongo_col:
             try:
                 await _mongo_col.delete_one({"label": label, "endpoint": endpoint})
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.error(f"MongoDB delete failed ({label}/{endpoint}): {exc}")
     else:
         removed = len(_registry.pop(label, []))
         if _mongo_col:
             try:
                 await _mongo_col.delete_many({"label": label})
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.error(f"MongoDB delete_many failed ({label}): {exc}")
 
     return {"status": "deregistered", "label": label, "removed": removed}
 

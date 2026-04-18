@@ -161,11 +161,6 @@ class AgentNSClient:
         resp.raise_for_status()
         return resp.json()
 
-    async def agents(self) -> Dict:
-        resp = await self._client.get("/agents")
-        resp.raise_for_status()
-        return resp.json()
-
     # ── context manager ───────────────────────────────────────────────────────
 
     async def __aenter__(self) -> "AgentNSClient":

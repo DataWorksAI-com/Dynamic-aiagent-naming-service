@@ -36,16 +36,18 @@ READ_TIMEOUT    = float(5)
 SLOW_MS         = float(2000)   # response time above which status becomes "degraded"
 
 _client: Optional[httpx.AsyncClient] = None
+_client_lock = asyncio.Lock()
 
 
-def _get_client() -> httpx.AsyncClient:
+async def _get_client() -> httpx.AsyncClient:
     global _client
-    if _client is None or _client.is_closed:
-        _client = httpx.AsyncClient(
-            timeout=httpx.Timeout(connect=CONNECT_TIMEOUT, read=READ_TIMEOUT, write=5, pool=5),
-            follow_redirects=True,
-            limits=httpx.Limits(max_connections=100, max_keepalive_connections=20),
-        )
+    async with _client_lock:
+        if _client is None or _client.is_closed:
+            _client = httpx.AsyncClient(
+                timeout=httpx.Timeout(connect=CONNECT_TIMEOUT, read=READ_TIMEOUT, write=5, pool=5),
+                follow_redirects=True,
+                limits=httpx.Limits(max_connections=100, max_keepalive_connections=20),
+            )
     return _client
 
 
@@ -76,7 +78,7 @@ async def check_agent_health(health_url: str) -> Dict:
     -------
     dict with keys: status, load, response_time_ms, last_check
     """
-    client = _get_client()
+    client = await _get_client()
     t0 = time.perf_counter()
     try:
         resp = await client.get(health_url)
