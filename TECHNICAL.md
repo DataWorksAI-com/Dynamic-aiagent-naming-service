@@ -24,6 +24,7 @@
    - 5.4 [cache.py](#54-cachepy--resolution-cache)
    - 5.5 [urn_parser.py](#55-urn_parserpy--urn-parsing)
    - 5.6 [client.py](#56-clientpy--python-client-sdk)
+   - 5.7 [geocoder.py](#57-geocoderpy--city-coordinate-lookup)
 6. [Data Models](#6-data-models)
 7. [Server Selection Algorithm](#7-server-selection-algorithm)
 8. [Concurrency Model](#8-concurrency-model)
@@ -117,7 +118,7 @@ agentns runs as a **sidecar process** alongside your orchestrator. Agents regist
 
 ```
 server.py
-   ├── urn_parser.py       (parse_urn, build_urn, extract_label)
+   ├── urn_parser.py       (parse_urn, build_urn)
    ├── health_checker.py   (check_agent_health, probe_endpoint)
    ├── server_selection.py (rank_servers, select_protocol, calculate_ttl)
    └── cache.py            (ResolutionCache)
@@ -636,7 +637,7 @@ The loop is cancelled cleanly during shutdown via `task.cancel()` + `await task`
 
 Returns the stored health dict if present, or a default dict with `status="unknown"` if the endpoint has never been probed. This prevents KeyError and ensures `rank_servers()` always receives a valid health dict.
 
-The "unknown" default causes `rank_servers()` to assign `health_score=2` (between degraded and unhealthy), which means never-probed endpoints are ranked lower than healthy endpoints but higher than unhealthy ones.
+The "unknown" default has `response_time_ms: 9999.0` — the same sentinel used by `rank_servers()` as its fallback in the sort key. This ensures that never-probed endpoints (status="unknown") sort below measured endpoints rather than appearing artificially fast. They are ranked lower than healthy endpoints but higher than unhealthy ones.
 
 ---
 
@@ -771,16 +772,27 @@ SLOW_MS         = 2000  # milliseconds above which status → "degraded"
 
 ---
 
-#### `_get_client() → httpx.AsyncClient`
+#### `_get_client() → httpx.AsyncClient` (async)
 
-Returns a shared singleton `httpx.AsyncClient`. Lazily created on first call. Recreated if the client has been closed.
+Returns a shared singleton `httpx.AsyncClient`. Lazily created on first call. Recreated if the client has been closed. Protected by a module-level `asyncio.Lock` (`_client_lock`) to prevent a race condition where two concurrent callers both see `_client is None` simultaneously and create duplicate clients.
+
+```python
+_client_lock = asyncio.Lock()
+
+async def _get_client() -> httpx.AsyncClient:
+    global _client
+    async with _client_lock:
+        if _client is None or _client.is_closed:
+            _client = httpx.AsyncClient(...)
+    return _client
+```
 
 The client is configured with:
 - **Connection pool**: up to 100 concurrent connections, 20 keepalive
 - **Redirects**: followed automatically
 - **Timeouts**: separate connect, read, write, and pool timeouts
 
-Using a singleton client (rather than creating a new one per check) is important for performance — it allows connection reuse and avoids the overhead of creating a new TLS session for every probe.
+Using a singleton client (rather than creating a new one per check) is important for performance — it allows connection reuse and avoids the overhead of creating a new TLS session for every probe. The function must be `await`ed by all callers.
 
 ---
 
@@ -849,7 +861,7 @@ This function is called when an endpoint was registered without a `health_check_
 
 #### `CITY_COORDS: Dict[str, Tuple[float, float]]`
 
-A lookup table mapping lowercase city name strings to `(latitude, longitude)` tuples. Covers 60+ cities across North America, Europe, Asia-Pacific, and South America.
+A lookup table mapping lowercase city name strings to `(latitude, longitude)` tuples. Covers 120+ cities across North America, Europe, Asia-Pacific, and South America.
 
 Used by:
 - `_resolve_location()` — to convert a requester's city name to coordinates
@@ -1111,7 +1123,7 @@ Simple f-string: `f"urn:{tld}:{namespace}:{label}"`. Used to construct the `agen
 
 #### `extract_label(value) → str`
 
-Convenience function. Calls `parse_urn()` and returns `.label`. If label is empty (malformed URN), returns the original string. Used in edge cases where the input might already be a plain label.
+Convenience function. Calls `parse_urn()` and returns `.label`. If label is empty (malformed URN), returns the original string. Available as a utility for external callers — not used internally by `server.py` (which uses `parse_urn()` directly).
 
 ---
 
@@ -1159,10 +1171,9 @@ Initialized with `url` (defaults to `AGENTNS_URL` env var) and `timeout` (defaul
 - Empty `endpoint` deregisters all replicas for the label.
 - Raises on HTTP error.
 
-**`health() → Dict`**  
-**`agents() → Dict`**
+**`health() → Dict`**
 
-- Direct passthrough to `/health` and `/agents` endpoints.
+- Direct passthrough to the `/health` endpoint. Returns the service health report including MongoDB status, uptime, and per-endpoint health states.
 
 **Context manager protocol** (`async with AgentNSClient(...) as c:`):
 - `__aenter__` returns `self`.
@@ -1184,6 +1195,37 @@ def resolve(self, agent_name, **kwargs):
 ```
 
 Creates and destroys an event loop per call. Fine for scripts, agent startup/shutdown code, and testing. Not suitable for high-throughput production paths — use `AgentNSClient` with `await` in those cases.
+
+---
+
+### 5.7 `geocoder.py` — City Coordinate Lookup
+
+**File:** `agentns/geocoder.py`  
+**Purpose:** Resolve a city name string to `(latitude, longitude)` coordinates. Used by `server_selection.py` when neither `CITY_COORDS` nor the in-memory cache contains the requested city.
+
+#### Resolution Order
+
+City coordinates are resolved through four steps, stopping at the first success:
+
+```
+1. CITY_COORDS dict (server_selection.py)  — 120+ built-in cities, zero latency
+2. In-memory geocoder cache               — cities seen before in this process run
+3. Nominatim API (geocoding.geo.census.gov or nominatim.openstreetmap.org)
+   — only if AGENTNS_GEOCODING=on (default)
+4. None                                   — disables geo routing for this request
+```
+
+#### `AGENTNS_GEOCODING` control
+
+```python
+GEOCODING_ENABLED = os.getenv("AGENTNS_GEOCODING", "on").lower() not in ("off", "false", "0")
+```
+
+When `AGENTNS_GEOCODING=off`, the Nominatim API is never called. Useful in air-gapped deployments or environments where external DNS/HTTP calls are prohibited. City names not in `CITY_COORDS` simply return `None`, which disables geo routing for that request (falling through to latency-based selection).
+
+#### In-memory cache
+
+Results from Nominatim are cached in a module-level dict for the lifetime of the process. A city resolved once is never fetched again in the same run. This cache is not TTL-based — city coordinates do not change.
 
 ---
 
@@ -1457,6 +1499,7 @@ All configuration is via environment variables. No config files. No hardcoded va
 | `AGENTNS_NAMESPACE` | `agents.local` | str | Default URN namespace for newly registered agents |
 | `AGENTNS_TLD` | `agentns.local` | str | URN TLD used in `agent_name` construction |
 | `AGENTNS_HEALTH_INTERVAL` | `30` | int | Seconds between background health sweeps |
+| `AGENTNS_GEOCODING` | `on` | str | Enable Nominatim geocoding fallback for city lookups. Set to `off` to disable external API calls and rely only on the built-in `CITY_COORDS` table |
 | `MONGODB_URI` | `""` | str | MongoDB connection string. Empty = in-memory mode |
 | `MONGODB_DB` | `agentns` | str | MongoDB database name |
 | `AGENTNS_URL` | `http://localhost:8200` | str | Used by `AgentNSClient()` with no arguments |
@@ -1588,7 +1631,8 @@ Every code path in agentns is designed to return a response rather than propagat
 | Scenario | Behavior |
 |----------|----------|
 | MongoDB unreachable at startup | Logs error, continues in-memory mode |
-| MongoDB write fails during register | Logs error, registration still succeeds in-memory |
+| MongoDB write fails during register | Logs error (was silent `pass` — now logged), registration still succeeds in-memory |
+| MongoDB delete fails during deregister | Logs error, deregistration still succeeds in-memory |
 | MongoDB load fails at startup | Logs error, starts with empty registry |
 | Health probe times out | Returns `_unhealthy("timeout")`, endpoint marked unhealthy |
 | Health probe connection refused | Returns `_unhealthy("connection refused")` |
@@ -1597,13 +1641,16 @@ Every code path in agentns is designed to return a response rather than propagat
 | Background health loop iteration fails | Logs warning, sleeps, retries next iteration |
 | `AgentNSClient.resolve()` throws | Catches all exceptions, returns `None` |
 | Unknown status in `_health_score()` | Defaults to `2` (unknown) |
-| City name not in `CITY_COORDS` | Returns `None` from `_resolve_location()`, disables geo |
+| City name not in `CITY_COORDS` | Falls through to Nominatim geocoder API if `AGENTNS_GEOCODING=on`, else returns `None` from `_resolve_location()`, disabling geo routing for that request |
+| URN TLD or namespace mismatch | HTTP 403 with error message identifying the mismatch |
+| Endpoint registered without `flag` field | Safe `.get("flag", "")` — no KeyError |
 
 ### HTTP Error Codes
 
 | Code | When |
 |------|------|
 | 400 | Missing required fields (`label`, `endpoint`, `agent_name`) |
+| 403 | URN TLD or namespace does not match this server's configured `AGENTNS_TLD` / `AGENTNS_NAMESPACE` |
 | 404 | Label not registered when resolving or deregistering |
 | 200 | All success cases, including `emergency_fallback` |
 
