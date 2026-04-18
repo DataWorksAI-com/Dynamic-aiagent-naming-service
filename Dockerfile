@@ -35,7 +35,7 @@ LABEL org.opencontainers.image.title="agentns"
 LABEL org.opencontainers.image.description="Agent Name Service sidecar for multi-agent systems"
 LABEL org.opencontainers.image.version="1.0.0"
 LABEL org.opencontainers.image.licenses="MIT"
-LABEL org.opencontainers.image.source="https://github.com/manikandan-dataworks/agentns"
+LABEL org.opencontainers.image.source="https://github.com/DataWorksAI-com/Dynamic-ans"
 
 WORKDIR /app
 
@@ -53,6 +53,7 @@ ENV AGENTNS_PORT=8200
 ENV AGENTNS_NAMESPACE=agents.local
 ENV AGENTNS_TLD=agentns.local
 ENV AGENTNS_HEALTH_INTERVAL=30
+ENV AGENTNS_GEOCODING=on
 # MONGODB_URI — set at runtime if persistence is needed
 
 EXPOSE 8200

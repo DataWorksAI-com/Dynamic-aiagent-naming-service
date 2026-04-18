@@ -1,0 +1,88 @@
+# =============================================================================
+# agentns — Production Docker Compose Override
+# =============================================================================
+#
+# Use this on top of docker-compose.yml for real server deployments.
+#
+# Start:
+#   docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d
+#
+# With MongoDB bundled:
+#   docker compose -f docker-compose.yml -f docker-compose.prod.yml \
+#     --profile mongo up -d
+#
+# All values come from your .env file — never hardcode anything here.
+# =============================================================================
+
+version: "3.9"
+
+services:
+
+  agentns:
+    # ── bind to all interfaces (not just localhost) ───────────────────────────
+    ports:
+      - "0.0.0.0:${AGENTNS_PORT:-8200}:8200"
+
+    # ── always restart on crash or reboot ─────────────────────────────────────
+    restart: always
+
+    # ── structured JSON logging → works with Datadog, Loki, CloudWatch ────────
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "5"
+
+    # ── resource limits ───────────────────────────────────────────────────────
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: "512M"
+        reservations:
+          cpus: "0.25"
+          memory: "128M"
+
+    # ── production environment ────────────────────────────────────────────────
+    environment:
+      AGENTNS_PORT:            "${AGENTNS_PORT:-8200}"
+      AGENTNS_TLD:             "${AGENTNS_TLD}"           # required — no default
+      AGENTNS_NAMESPACE:       "${AGENTNS_NAMESPACE}"     # required — no default
+      AGENTNS_HEALTH_INTERVAL: "${AGENTNS_HEALTH_INTERVAL:-30}"
+      AGENTNS_GEOCODING:       "${AGENTNS_GEOCODING:-on}"
+      MONGODB_URI:             "${MONGODB_URI:-}"
+      MONGODB_DB:              "${MONGODB_DB:-agentns}"
+
+    # ── tighter healthcheck in production ─────────────────────────────────────
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request; urllib.request.urlopen('http://localhost:8200/health')"]
+      interval: 15s
+      timeout:  5s
+      retries:  5
+      start_period: 15s
+
+  # ── production MongoDB (if not using Atlas) ───────────────────────────────
+  mongo:
+    restart: always
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "100m"
+        max-file: "3"
+    deploy:
+      resources:
+        limits:
+          memory: "1G"
+    # persist data to a named volume — survives container restarts
+    volumes:
+      - mongo-data:/data/db
+    # require auth in production
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: "${MONGO_ROOT_USER:-agentns}"
+      MONGO_INITDB_ROOT_PASSWORD: "${MONGO_ROOT_PASS}"      # required if using bundled mongo
+      MONGO_INITDB_DATABASE:      "agentns"
+
+volumes:
+  mongo-data:
+    driver: local
