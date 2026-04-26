@@ -37,8 +37,9 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 import uvicorn
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, Request
 
+from .auth             import security_headers_middleware, validate_secrets_on_startup, verify_api_key
 from .cache            import ResolutionCache
 from .geocoder         import resolve_city, geocode_cache_snapshot
 from .health_checker   import check_agent_health, probe_endpoint
@@ -59,6 +60,26 @@ DEFAULT_TLD      = os.getenv("AGENTNS_TLD",                 "agentns.local")
 HEALTH_INTERVAL  = int(os.getenv("AGENTNS_HEALTH_INTERVAL", "30"))
 MONGODB_URI      = os.getenv("MONGODB_URI",                 "")
 MONGODB_DB       = os.getenv("MONGODB_DB",                  "agentns")
+
+# ── A2A Proxy config (optional — when set, /resolve returns proxy URL) ─────────
+# Set A2A_PROXY_ENDPOINTS to a comma-separated list of proxy base URLs.
+# When set, /resolve returns the proxy URL instead of the direct agent URL,
+# and adds slim_identity to the response for SLIM-based routing.
+#
+# Example:
+#   A2A_PROXY_ENDPOINTS=http://proxy.example.com:8400
+#   SLIM_ORG=my-org
+#
+# Response will include:
+#   url:           "http://proxy.example.com:8400/a2a/my-namespace/alerts"
+#   via_proxy:     true
+#   slim_identity: "my-org/my-namespace/alerts"
+_PROXY_ENDPOINTS: List[str] = [
+    ep.strip()
+    for ep in os.getenv("A2A_PROXY_ENDPOINTS", "").split(",")
+    if ep.strip()
+]
+SLIM_ORG = os.getenv("SLIM_ORG", "")
 
 _start_time = _time.time()
 
@@ -187,6 +208,7 @@ async def _check_single(endpoint_url: str, hc_url: str) -> None:
 
 @asynccontextmanager
 async def lifespan(application: FastAPI):
+    validate_secrets_on_startup()   # crash early if secrets misconfigured
     await _init_mongo()
     await _load_from_mongo()
     await _check_all()          # initial sweep so first /resolve has real data
@@ -209,17 +231,78 @@ app = FastAPI(
     description=(
         "Single-binary service discovery sidecar for multi-agent systems.\n\n"
         "Register agents with POST /register. Resolve them with POST /resolve using "
-        "standard URNs (urn:tld:namespace:label). Language-agnostic HTTP API."
+        "standard URNs (urn:tld:namespace:label). Language-agnostic HTTP API.\n\n"
+        "**Authentication:** POST endpoints require `X-API-Key` header when "
+        "`AGENTNS_AUTH=on` (default). GET endpoints are always open."
     ),
-    version="1.0.0",
+    version="2.0.0",
     lifespan=lifespan,
 )
+
+# ── Security headers middleware ────────────────────────────────────────────────
+app.middleware("http")(security_headers_middleware)
+
+
+# ── Rate limiting (optional — requires slowapi) ────────────────────────────────
+try:
+    from slowapi import Limiter, _rate_limit_exceeded_handler
+    from slowapi.errors import RateLimitExceeded
+    from slowapi.util import get_remote_address
+
+    _limiter = Limiter(key_func=get_remote_address)
+    app.state.limiter = _limiter
+    app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+    _RATE_LIMIT_AVAILABLE = True
+    logger.info("Rate limiting enabled (slowapi)")
+except ImportError:
+    _RATE_LIMIT_AVAILABLE = False
+    logger.warning("slowapi not installed — rate limiting disabled. pip install slowapi")
+
+
+# ── Proxy helpers ─────────────────────────────────────────────────────────────
+
+def _pick_proxy() -> Optional[str]:
+    """Return the first configured A2A proxy base URL, or None."""
+    return _PROXY_ENDPOINTS[0] if _PROXY_ENDPOINTS else None
+
+
+def _build_proxy_response(result: Dict, label: str, namespace: str) -> Dict:
+    """
+    Enrich a resolve result with proxy URL and SLIM identity when A2A_PROXY_ENDPOINTS is set.
+
+    Before (no proxy):
+        result["endpoint"] = "http://agent-host:9001"
+
+    After (with proxy):
+        result["url"]           = "http://proxy:8400/a2a/my-namespace/alerts"
+        result["endpoint"]      = "http://proxy:8400/a2a/my-namespace/alerts"  ← compat alias
+        result["via_proxy"]     = True
+        result["slim_identity"] = "my-org/my-namespace/alerts"
+        result["metadata"]["direct_endpoint"] = "http://agent-host:9001"       ← preserved
+    """
+    proxy_base = _pick_proxy()
+    if not proxy_base:
+        result["via_proxy"]     = False
+        result["slim_identity"] = ""
+        result["url"]           = result.get("endpoint", "")
+        return result
+
+    direct_endpoint = result.get("endpoint", "")
+    proxy_url       = f"{proxy_base}/a2a/{namespace}/{label}"
+    slim_id         = f"{SLIM_ORG}/{namespace}/{label}" if SLIM_ORG else f"{namespace}/{label}"
+
+    result["url"]           = proxy_url
+    result["endpoint"]      = proxy_url      # backward-compat alias
+    result["via_proxy"]     = True
+    result["slim_identity"] = slim_id
+    result.setdefault("metadata", {})["direct_endpoint"] = direct_endpoint
+    return result
 
 
 # ── POST /resolve ──────────────────────────────────────────────────────────────
 
-@app.post("/resolve")
-async def resolve(body: dict):
+@app.post("/resolve", dependencies=[Depends(verify_api_key)])
+async def resolve(request: Request, body: dict):
     """
     Resolve an agent by URN or label.
 
@@ -401,8 +484,12 @@ async def resolve(body: dict):
         await _cache.set(cache_key, result, ttl)
     result.pop("_cache_key_agent", None)
 
+    # Enrich with proxy URL + slim_identity when A2A_PROXY_ENDPOINTS is configured
+    namespace = best_server.get("namespace", DEFAULT_NS)
+    result = _build_proxy_response(result, label, namespace)
+
     logger.info(
-        f"Resolved '{label}': {best_server['endpoint']} "
+        f"Resolved '{label}': {result.get('url') or result.get('endpoint')} "
         f"({best_health.get('response_time_ms', 0):.0f}ms, ttl={ttl}s, by={selected_by})"
     )
     return result
@@ -410,8 +497,8 @@ async def resolve(body: dict):
 
 # ── POST /register ─────────────────────────────────────────────────────────────
 
-@app.post("/register", status_code=200)
-async def register(body: dict):
+@app.post("/register", status_code=200, dependencies=[Depends(verify_api_key)])
+async def register(request: Request, body: dict):
     """
     Register an agent endpoint.
 
@@ -626,8 +713,8 @@ async def cache_stats():
     return await _cache.stats()
 
 
-@app.post("/cache/clear")
-async def cache_clear():
+@app.post("/cache/clear", dependencies=[Depends(verify_api_key)])
+async def cache_clear(request: Request):
     count = await _cache.clear()
     return {"status": "cleared", "entries_removed": count}
 

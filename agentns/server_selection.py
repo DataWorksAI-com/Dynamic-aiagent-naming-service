@@ -25,7 +25,10 @@ by default (``include_unhealthy=False``).
 from __future__ import annotations
 
 import math
-from typing import Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
+
+if TYPE_CHECKING:
+    from agentns.geo_policy import GeoPolicy
 
 
 # ── well-known city coordinates ─────────────────────────────────────────────────
@@ -231,6 +234,7 @@ def rank_servers(
     health_map: Dict[str, Dict],
     requester_context: Optional[Dict] = None,
     include_unhealthy: bool = False,
+    geo_policy: Optional["GeoPolicy"] = None,
 ) -> List[Tuple[Dict, Dict]]:
     """
     Rank *servers* and return ``[(server, health), ...]`` best-first.
@@ -250,14 +254,27 @@ def rank_servers(
     include_unhealthy:
         If False (default), servers with status ``"unhealthy"`` are excluded
         from the ranked result (but the caller can still fall back to them).
+
+    geo_policy:
+        Optional GeoPolicy instance to control the geo/load scoring strategy.
+        Defaults to CompositePolicy() which balances distance + RTT + load.
+        Pass NearestPolicy() for pure haversine, LeastLoadedPolicy() for load-only.
+
+        Example:
+            from agentns.geo_policy import NearestPolicy
+            ranked = rank_servers(servers, health_map, ctx, geo_policy=NearestPolicy())
     """
+    # Import here to avoid circular import (geo_policy imports math, not server_selection)
+    from agentns.geo_policy import CompositePolicy
+    policy = geo_policy or CompositePolicy()
+
     ctx = requester_context or {}
     preferred = ctx.get("protocols") or []
     requester_latlon = _resolve_location(ctx)
 
     scored: List[Tuple] = []
     for server in servers:
-        sid   = server["server_id"]
+        sid    = server["server_id"]
         health = health_map.get(sid, {"status": "unknown", "load": 50.0, "response_time_ms": 9999.0})
         status = health.get("status", "unknown")
 
@@ -265,16 +282,17 @@ def rank_servers(
             continue
 
         # Protocol score — 0 if any preferred protocol is available
-        server_protos = [p.upper() for p in (server.get("protocols") or [])]
+        server_protos   = [p.upper() for p in (server.get("protocols") or [])]
         preferred_upper = [p.upper() for p in preferred]
-        proto_score = 0 if any(p in server_protos for p in preferred_upper) else 1
+        proto_score     = 0 if any(p in server_protos for p in preferred_upper) else 1
+
+        # Geo/load score via pluggable policy (lower = better)
+        geo_score = policy.score(server, health, requester_latlon)
 
         sort_key = (
-            _health_score(status),
-            proto_score,
-            _geo_distance(server, requester_latlon),
-            health.get("response_time_ms", 9999.0),
-            health.get("load", 50.0),
+            _health_score(status),  # 0=healthy, 1=degraded, 2=unknown, 3=unhealthy
+            proto_score,            # 0=preferred protocol available, 1=not
+            geo_score,              # from geo_policy (encodes distance + rtt + load)
         )
         scored.append((sort_key, server, health))
 

@@ -1,517 +1,351 @@
 # agentns — Agent Name Service
 
-> **DNS for AI agents.** A single-binary sidecar that gives every agent in your multi-agent system a stable name, automatic health monitoring, geographic routing, and TTL-based caching — over a plain HTTP API any language can call.
+> **Plug-and-play service discovery for multi-agent AI systems.**  
+> Register agents. Resolve them by name. Route through any backend — HTTP registry, Consul, Kubernetes, or a static YAML file.
 
-[![MIT License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
-[![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://python.org)
-[![Docker](https://img.shields.io/badge/docker-manikandan3110%2Fagentns-blue.svg)](https://hub.docker.com/r/manikandan3110/agentns)
-
----
-
-## The problem
-
-In a multi-agent system, agents call other agents. This works fine with two agents. With ten agents deployed across clouds and regions it breaks:
-
-- **Hardcoded URLs** break when you scale or failover
-- **No health awareness** — your orchestrator blindly calls a dead agent
-- **No geo-routing** — a user in Tokyo gets routed to a server in Boston
-- **No fallback** — one bad endpoint takes down the whole chain
-
-agentns solves all of this. It is the service mesh **for agents**, not services.
+[![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue)](https://python.org)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
 ---
 
-## How it works
+## What it does
 
-```
-Your orchestrator                agentns sidecar              Your agents
-──────────────────               ───────────────              ───────────
-                                                              emailer-nyc :9001  ←  register on startup
-POST /resolve                    health loop (30s)            emailer-lon :9001  ←  register on startup
-{"agent_name":                   ┌─────────────────┐         invoicer    :9002  ←  register on startup
- "urn:co.com:sales:emailer"}  →  │ rank by:        │
-                                 │  1. health       │
-{"endpoint":                  ←  │  2. geo distance │
- "http://emailer-nyc:9001",      │  3. latency      │
- "ttl": 60,                      │  4. load %       │
- "selected_by": "geo_nearest"}   └─────────────────┘
-```
+agentns is a single-binary nameservice sidecar that:
 
-Three things happen automatically, with zero code changes to your agents:
-
-1. **Background health sweep** (every 30 s) probes every registered endpoint
-2. **Resolution** picks the best live endpoint for each request using health + geo + latency
-3. **TTL cache** stores results so your orchestrator gets sub-millisecond responses on repeat calls
+- **Registers** agent endpoints by label (`alerts`, `planner`, etc.)
+- **Resolves** agents by URN (`urn:agents.example.com:my-app:alerts`) to live, health-checked endpoints
+- **Routes** to the best server using geo-proximity, load, and protocol preference
+- **Plugs into any backend** — HTTP registry, Consul, Kubernetes, or static YAML
+- **Secures** endpoints with API key auth + rate limiting + security headers
 
 ---
 
 ## Quick start
 
-### Local (Docker)
-
-```bash
-docker run -p 8200:8200 manikandan3110/agentns:latest
-```
-
-### On a remote server (production)
-
-```bash
-# One-command deploy to any Linux server
-# Installs Docker, builds image, sets up systemd, opens firewall
-./deploy.sh root@your-server-ip --env .env
-```
-
-agentns is now reachable at `http://your-server-ip:8200` from any machine.
-
-### Docker Compose
-
-```bash
-cp .env.example .env
-# Edit .env — set AGENTNS_TLD, AGENTNS_NAMESPACE, MONGODB_URI
-
-# Local dev
-docker compose up
-
-# Production (binds all interfaces, restart:always, logging)
-docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d
-
-# Production + bundled MongoDB
-docker compose -f docker-compose.yml -f docker-compose.prod.yml --profile mongo up -d
-```
-
-### pip
-
 ```bash
 pip install agentns
-agentns-server --namespace my-app
+agentns-server --port 8200   # start the server
+```
+
+**Target agent** — register yourself so others can find you:
+
+```python
+import agentns
+
+client = agentns.target_lib.connect()   # reads AGENTNS_URL + AGENTNS_API_KEY from env
+await client.record(agentns.DeploymentSpec(
+    leaf_name  = "alerts",
+    a2a_url    = "http://myhost:9001",
+    health_url = "http://myhost:9001/health",
+    location   = {"city": "Boston"},
+    protocols  = ["A2A"],
+))
+```
+
+**Requester agent** — resolve other agents:
+
+```python
+import agentns
+
+client   = agentns.requester_lib.connect()  # reads AGENTNS_RESOLVER_URL + AGENTNS_API_KEY from env
+endpoint = await client.resolve(agentns.Query.from_label("alerts"))
+
+if endpoint:
+    import httpx
+    async with httpx.AsyncClient() as c:
+        r = await c.post(endpoint.url, json={"message": "Red Line status?"})
 ```
 
 ---
 
-### Try it
-
-```bash
-# Register an agent
-curl -X POST http://localhost:8200/register \
-  -H "Content-Type: application/json" \
-  -d '{"label":"emailer","endpoint":"http://my-agent:9001","region":"us-east","location":{"city":"New York"}}'
-
-# Resolve it
-curl -X POST http://localhost:8200/resolve \
-  -H "Content-Type: application/json" \
-  -d '{"agent_name":"urn:agentns.local:agents.local:emailer"}'
-```
-
-Response:
-```json
-{
-  "endpoint": "http://my-agent:9001",
-  "protocol": "http",
-  "ttl": 60,
-  "region": "New York",
-  "cached": false,
-  "selected_by": "only_available",
-  "resolution_time_ms": 1.4
-}
-```
-
----
-
-## URN format
-
-agentns uses a hierarchical URN scheme inspired by DNS:
+## Architecture
 
 ```
-urn : <tld> : <namespace> : <label>
- │       │         │           └── agent role   (e.g. emailer, planner, alerts)
- │       │         └────────────── your app/org (e.g. sales, mbta-transit-ci)
- │       └──────────────────────── your domain  (e.g. acme.com, agents.local)
- └──────────────────────────────── literal "urn"
-```
-
-Examples:
-```
-urn:acme.com:sales:emailer
-urn:acme.com:sales:invoicer
-urn:agents.dataworksai.com:mbta-transit-ci:alerts
-```
-
-You can also resolve by short label:
-```json
-{"label": "emailer"}
+Requester Agent
+  │  agentns.requester_lib.connect()
+  │  await client.resolve(Query.from_label("alerts"))
+  ▼
+agentns server (:8200)
+  │  health-checks all registered endpoints
+  │  geo-ranks by proximity + load (pluggable GeoPolicy)
+  │  returns TailoredEndpoint
+  │
+  │  optional: if A2A_PROXY_ENDPOINTS is set
+  │  returns proxy URL + slim_identity instead of direct URL
+  ▼
+Target Agent  (or A2A Proxy → SLIM Controller → Agent SLIM listener)
+  registered via agentns.target_lib.record()
 ```
 
 ---
 
 ## API reference
 
-### `POST /register` — Register an agent endpoint
+### POST /resolve
 
-```json
-{
-  "label":           "emailer",
-  "endpoint":        "http://my-agent:9001",
-  "namespace":       "acme.sales",
-  "region":          "us-east",
-  "region_label":    "New York, NY",
-  "location":        {"city": "New York"},
-  "protocols":       ["http", "A2A"],
-  "health_check_url":"http://my-agent:9001/health",
-  "flag":            "🇺🇸"
-}
+Resolve an agent URN to a live endpoint. Requires `X-API-Key` header.
+
+```bash
+curl -X POST http://localhost:8200/resolve \
+  -H "X-API-Key: your-key" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "agent_name": "urn:agents.example.com:my-app:alerts",
+    "requester_context": {"location": {"city": "Boston"}, "protocols": ["A2A"]},
+    "cache_enabled": true
+  }'
 ```
-
-| Field | Required | Default | Notes |
-|-------|----------|---------|-------|
-| `label` | ✅ | — | Short agent name, e.g. `emailer` |
-| `endpoint` | ✅ | — | Full URL the orchestrator will call |
-| `namespace` | | `AGENTNS_NAMESPACE` env | URN namespace |
-| `region` | | `""` | Region code, e.g. `us-east` |
-| `region_label` | | same as `region` | Human-readable, e.g. `New York, NY` |
-| `location` | | `{}` | `{"city":"New York"}` or `{"latitude":40.7,"longitude":-74.0}` |
-| `protocols` | | `["http"]` | `A2A`, `http`, `SLIM`, etc. |
-| `health_check_url` | | auto-discovered | Falls back to `/.well-known/agent.json` then `/health` |
-| `flag` | | `""` | Emoji flag for UI display |
-
-Multiple registrations for the same `label` create a **replica pool**. agentns picks the best one on each resolve.
-
----
-
-### `POST /resolve` — Resolve an agent
-
-```json
-{
-  "agent_name": "urn:acme.com:sales:emailer",
-  "requester_context": {
-    "location":  {"city": "Boston"},
-    "protocols": ["A2A", "http"]
-  },
-  "cache_enabled": true
-}
-```
-
-| Field | Notes |
-|-------|-------|
-| `agent_name` | Full URN, or use `label` for short form |
-| `requester_context.location` | City name or lat/lon — enables geo routing |
-| `requester_context.protocols` | Preferred protocol order |
-| `cache_enabled` | Default `true` — set `false` to force fresh resolution |
 
 Response:
+
 ```json
 {
-  "endpoint":    "http://my-agent-nyc:9001",
-  "protocol":    "A2A",
-  "ttl":         60,
-  "region":      "New York, NY",
-  "flag":        "🇺🇸",
-  "cached":      false,
-  "selected_by": "geo_nearest",
-  "resolution_time_ms": 1.2,
-  "metadata": {
-    "label":            "emailer",
-    "latency_ms":       42.1,
-    "total_candidates": 2,
-    "all_candidates": [
-      {"endpoint":"http://my-agent-nyc:9001","status":"healthy","latency_ms":42,"region":"New York, NY"},
-      {"endpoint":"http://my-agent-lon:9001","status":"healthy","latency_ms":218,"region":"London, UK"}
-    ]
-  }
+  "url":           "http://host:9001",
+  "endpoint":      "http://host:9001",
+  "protocol":      "A2A",
+  "ttl":           60,
+  "region":        "us-east",
+  "via_proxy":     false,
+  "slim_identity": "",
+  "cached":        false,
+  "selected_by":   "geo_nearest",
+  "resolution_time_ms": 4.2
 }
 ```
 
-`selected_by` values:
-| Value | Meaning |
-|-------|---------|
-| `geo_nearest` | Location provided, picked closest healthy endpoint |
-| `lowest_latency` | No location, picked fastest healthy endpoint |
-| `only_available` | Only one healthy endpoint existed |
-| `emergency_fallback` | All endpoints unhealthy — returned best guess |
+When `A2A_PROXY_ENDPOINTS` is configured, `url` points to the proxy instead of the direct agent, and `via_proxy`/`slim_identity` are populated.
 
----
+### POST /register
 
-### Other endpoints
+Register an agent endpoint. Requires `X-API-Key` header.
 
-| Method | Path | Description |
-|--------|------|-------------|
-| `GET` | `/health` | Service health + per-agent status |
-| `GET` | `/agents` | All registered agents with current health |
-| `GET` | `/namespaces` | All registered namespaces |
-| `DELETE` | `/register/{label}` | Deregister label (body: `{"endpoint":"..."}` for specific) |
-| `GET` | `/cache/stats` | Cache hit rate, entry counts |
-| `POST` | `/cache/clear` | Flush the resolution cache |
-
----
-
-## Python client
-
-```python
-from agentns.client import AgentNSClient
-
-async with AgentNSClient("http://localhost:8200") as client:
-
-    # Register on agent startup
-    await client.register(
-        "emailer", "http://my-host:9001",
-        region="us-east",
-        location={"city": "New York"},
-        protocols=["http", "A2A"],
-    )
-
-    # Resolve in orchestrator
-    resolved = await client.resolve(
-        "urn:acme.com:sales:emailer",
-        requester_context={"location": {"city": "Boston"}, "protocols": ["A2A"]},
-    )
-
-    if resolved:
-        print(resolved.endpoint)        # http://my-host:9001
-        print(resolved.selected_by)     # geo_nearest
-        print(resolved.resolution_time_ms)  # 1.3
+```bash
+curl -X POST http://localhost:8200/register \
+  -H "X-API-Key: your-key" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "label":     "alerts",
+    "endpoint":  "http://myhost:9001",
+    "location":  {"city": "Boston"},
+    "protocols": ["A2A"]
+  }'
 ```
 
-`resolved` is a `ResolvedAgent` dataclass with fields:
-`endpoint`, `protocol`, `ttl`, `region`, `flag`, `cached`, `selected_by`, `resolution_time_ms`, `metadata`
+### GET /health
+
+Returns server health + all registered agents. **No auth required.**
+
+### GET /agents
+
+List all registered agents with live health status. **No auth required.**
 
 ---
 
-## Configuration
+## Pluggable registry backends
 
-All config via environment variables — zero hardcoded values.
+agentns can resolve agents from any backend:
+
+```python
+from agentns.registry_adapter import (
+    HttpRegistryAdapter,    # POST /resolve to any HTTP registry (default)
+    StaticRegistryAdapter,  # in-memory dict or YAML file (zero infra)
+    MultiRegistryAdapter,   # fan-out: try multiple registries in order
+    RegistryAdapter,        # ABC — implement your own (Consul, K8s, etcd...)
+)
+```
+
+### Static YAML (zero infra — great for dev/testing)
+
+```bash
+REGISTRY_ADAPTER=static
+REGISTRY_YAML=/etc/agentns/agents.yaml
+```
+
+```yaml
+# agents.yaml
+my-app:alerts:
+  endpoint: http://localhost:9001
+  protocol: A2A
+  ttl: 60
+my-app:planner:
+  endpoint: http://localhost:9002
+  protocol: A2A
+  ttl: 60
+```
+
+### HTTP registry (default)
+
+```bash
+REGISTRY_URL=http://my-registry:6900
+```
+
+The registry must expose `POST /resolve` returning `{"endpoint", "protocol", "ttl"}`.
+
+### Multi-registry (primary + fallback)
+
+```bash
+REGISTRY_ADAPTER=multi
+REGISTRY_URLS=http://primary:6900,http://backup:6900
+```
+
+### Custom adapter — plug in Consul, Kubernetes, etcd, or anything
+
+```python
+from agentns.registry_adapter import RegistryAdapter
+
+class ConsulAdapter(RegistryAdapter):
+    async def resolve(self, agent_path, requester_context):
+        import httpx
+        label = agent_path.split(":")[-1]
+        async with httpx.AsyncClient() as c:
+            r = await c.get(f"http://consul:8500/v1/health/service/{label}?passing=true")
+        services = r.json()
+        if not services:
+            return None
+        svc = services[0]["Service"]
+        return {"endpoint": f"http://{svc['Address']}:{svc['Port']}", "protocol": "A2A", "ttl": 30}
+
+    async def health(self):
+        return {"status": "ok"}
+```
+
+See [`examples/custom_registry_adapter.py`](examples/custom_registry_adapter.py) for Consul, Kubernetes, and multi-registry examples.
+
+---
+
+## Pluggable geo-selection
+
+Control how servers are ranked when multiple instances are registered:
+
+```python
+from agentns.geo_policy import NearestPolicy, LeastLoadedPolicy, CompositePolicy
+from agentns.server_selection import rank_servers
+
+# Default: balance distance + RTT + load (CompositePolicy)
+ranked = rank_servers(servers, health_map, ctx)
+
+# Pure Haversine distance (CDN-style edge selection)
+ranked = rank_servers(servers, health_map, ctx, geo_policy=NearestPolicy())
+
+# Ignore geo, rank by current load only
+ranked = rank_servers(servers, health_map, ctx, geo_policy=LeastLoadedPolicy())
+
+# Tune composite weights
+ranked = rank_servers(servers, health_map, ctx,
+                      geo_policy=CompositePolicy(geo_weight=2.0, rtt_weight=0.0))
+```
+
+Write your own:
+
+```python
+from agentns.geo_policy import GeoPolicy
+
+class LatencyOnlyPolicy(GeoPolicy):
+    def score(self, server, health, requester_latlon):
+        return health.get("response_time_ms", 9999.0)
+```
+
+---
+
+## Security
+
+### API key authentication
+
+```bash
+# Generate a secure key (≥32 chars required):
+python -c "import secrets; print(secrets.token_urlsafe(32))"
+
+# Configure (comma-separated for zero-downtime key rotation):
+export AGENTNS_API_KEYS="key1-abc...,key2-def..."
+```
+
+All POST endpoints require `X-API-Key: <key>`. GET endpoints (`/health`, `/agents`, `/namespaces`) are always open for monitoring.
+
+To disable auth in local development only:
+
+```bash
+export AGENTNS_AUTH=off
+```
+
+### Rate limiting
+
+```bash
+pip install "agentns[server]"   # includes slowapi
+```
+
+Default limits: 60 req/min on `/resolve`, 60 req/min on `/register`, 5 req/min on `/cache/clear`.
+
+### Security headers
+
+All responses include `X-Content-Type-Options`, `X-Frame-Options`, `X-XSS-Protection`, `Referrer-Policy`, and `Cache-Control: no-store`.
+
+---
+
+## Configuration reference
 
 | Variable | Default | Description |
-|----------|---------|-------------|
+|---|---|---|
 | `AGENTNS_PORT` | `8200` | HTTP port |
 | `AGENTNS_NAMESPACE` | `agents.local` | Default URN namespace |
-| `AGENTNS_TLD` | `agentns.local` | Default URN TLD |
-| `AGENTNS_HEALTH_INTERVAL` | `30` | Background health sweep interval (seconds) |
-| `MONGODB_URI` | *(empty)* | MongoDB connection string — omit for in-memory mode |
-| `MONGODB_DB` | `agentns` | MongoDB database name |
-| `AGENTNS_GEOCODING` | `on` | Set to `off` in air-gapped environments — built-in 120+ city table still works |
-| `AGENTNS_URL` | `http://localhost:8200` | Used by `AgentNSClient()` with no args |
+| `AGENTNS_TLD` | `agentns.local` | URN top-level domain |
+| `AGENTNS_API_KEYS` | *(required if auth=on)* | Comma-separated API keys (≥32 chars) |
+| `AGENTNS_AUTH` | `on` | `off` to disable auth (dev only) |
+| `AGENTNS_HEALTH_INTERVAL` | `30` | Background health sweep interval (s) |
+| `MONGODB_URI` | *(none)* | MongoDB URI (in-memory if absent) |
+| `REGISTRY_ADAPTER` | `http` | `http` / `static` / `multi` |
+| `REGISTRY_URL` | `http://localhost:6900` | HTTP registry URL |
+| `REGISTRY_YAML` | `agents.yaml` | Static registry YAML file |
+| `REGISTRY_URLS` | *(none)* | Comma-separated URLs for multi-adapter |
+| `A2A_PROXY_ENDPOINTS` | *(none)* | Comma-separated A2A proxy base URLs |
+| `SLIM_ORG` | *(none)* | SLIM org prefix for `slim_identity` |
 
-**In-memory mode** (no MongoDB): fast start, registrations lost on restart. Fine for local dev.
+**Client environment variables:**
 
-**MongoDB mode**: registrations survive restarts. All registered endpoints are reloaded and health-checked at startup.
-
----
-
-## Server selection algorithm
-
-When multiple endpoints are registered for the same label, agentns ranks them by a 5-key sort tuple:
-
-```
-(health_score, protocol_score, geo_distance_km, response_time_ms, load_percent)
-```
-
-Lower is better. The first key that differs determines the winner:
-
-1. **Health** — `healthy=0`, `degraded=1`, `unknown=2`, `unhealthy=3`
-   Unhealthy endpoints are excluded from results entirely.
-
-2. **Protocol** — `0` if a preferred protocol is available, `1` otherwise.
-
-3. **Geographic distance** — haversine great-circle distance from the requester's city/lat-lon.
-   `∞` if no location is given (falls through to latency).
-
-4. **Response time** — actual measured round-trip in milliseconds from the most recent health sweep.
-
-5. **Load** — CPU/load percent reported by the agent's health endpoint.
-
-**TTL** is calculated from health status: healthy→60s, degraded→15s, unknown→10s, unhealthy→5s.
+| Variable | Default | Description |
+|---|---|---|
+| `AGENTNS_URL` | `http://localhost:8200` | Server URL |
+| `AGENTNS_RESOLVER_URL` | *(AGENTNS_URL)* | Resolver URL (requester_lib) |
+| `AGENTNS_API_KEY` | *(none)* | Client API key |
+| `ANS_TLD` | `agentns.local` | TLD for `AgentName.from_label()` |
+| `ANS_APP` | `default` | Namespace for `AgentName.from_label()` |
 
 ---
 
-## Real-world example: MBTA Transit
-
-agentns was extracted from the **MBTA Transit AI assistant** — a production multi-agent system with:
-
-- 4 specialist agents: `alerts`, `planner`, `stopfinder`, `fares`
-- Geographic replicas: Boston (primary) + Frankfurt (failover)
-- Automatic failover: Boston fares goes down → Frankfurt takes over within one health interval (30s)
-- Automatic recovery: Boston comes back → it wins again on next sweep (lower latency, same geo score)
-
-```python
-# MBTA orchestrator (simplified)
-from agentns.client import AgentNSClient
-
-client = AgentNSClient("http://localhost:8200")
-
-async def get_fares(user_city: str) -> dict:
-    resolved = await client.resolve(
-        "urn:agents.dataworksai.com:mbta-transit-ci:fares",
-        requester_context={
-            "protocols": ["A2A"],
-            "location":  {"city": user_city},
-        },
-    )
-    if not resolved:
-        return {"error": "fares agent unavailable"}
-
-    # resolved.endpoint is "http://boston-ip:8004" normally,
-    # "http://frankfurt-ip:8004" when Boston is unhealthy
-    return await call_agent(resolved.endpoint, {"query": "CharlieCard monthly pass"})
-```
-
-To run the full MBTA demo: `python examples/mbta_transit_example.py`
-
----
-
-## Integration — any language
-
-agentns speaks plain HTTP. No SDK required.
-
-**Node.js:**
-```js
-const resolve = async (agentName, city) => {
-  const res = await fetch("http://localhost:8200/resolve", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      agent_name: agentName,
-      requester_context: { location: { city }, protocols: ["http"] },
-    }),
-  });
-  return res.json();   // { endpoint, ttl, selected_by, ... }
-};
-
-const { endpoint } = await resolve("urn:acme.com:sales:emailer", "London");
-await fetch(`${endpoint}/send`, { method: "POST", body: JSON.stringify(email) });
-```
-
-**Go:**
-```go
-type ResolveReq struct {
-    AgentName        string         `json:"agent_name"`
-    RequesterContext map[string]any `json:"requester_context"`
-}
-type ResolveResp struct {
-    Endpoint   string `json:"endpoint"`
-    Protocol   string `json:"protocol"`
-    TTL        int    `json:"ttl"`
-    SelectedBy string `json:"selected_by"`
-}
-
-func resolveAgent(agentName, city string) (*ResolveResp, error) {
-    body, _ := json.Marshal(ResolveReq{
-        AgentName: agentName,
-        RequesterContext: map[string]any{
-            "location":  map[string]string{"city": city},
-            "protocols": []string{"http"},
-        },
-    })
-    resp, err := http.Post("http://localhost:8200/resolve",
-        "application/json", bytes.NewReader(body))
-    if err != nil { return nil, err }
-    var result ResolveResp
-    json.NewDecoder(resp.Body).Decode(&result)
-    return &result, nil
-}
-```
-
-**Shell / CI:**
-```bash
-ENDPOINT=$(curl -sf http://localhost:8200/resolve \
-  -d '{"label":"emailer"}' \
-  -H "Content-Type: application/json" | jq -r .endpoint)
-
-curl -X POST "$ENDPOINT/send" -d '{"to":"alice@example.com"}'
-```
-
----
-
-## Health check protocol
-
-agentns probes endpoints in this order at every health sweep:
-
-1. **Explicit `health_check_url`** — if you provided one at registration
-2. **`/.well-known/agent.json`** — [A2A AgentCard](https://google.github.io/A2A/) standard
-3. **`/health`** — REST convention
-4. **`/healthz`** — Kubernetes convention
-
-Any 2xx response = healthy. Response time > 2 s = degraded. Connection refused / non-2xx = unhealthy.
-
-If the agent's health endpoint returns JSON with a `load_percent` or `load` field, agentns uses it for load-based routing:
-```json
-{ "status": "healthy", "load_percent": 42.0 }
-```
-
----
-
-## Deployment patterns
-
-### Remote server (production)
-Deploy to any Linux VPS in one command. agentns runs as a systemd service, survives reboots, restarts on crash.
+## Docker
 
 ```bash
-# Fill in your config
-cp .env.example .env
+# Development (no auth):
+docker run -p 8200:8200 -e AGENTNS_AUTH=off ghcr.io/tonystark3110/agentns:latest
 
-# Deploy — works on Ubuntu, Debian, CentOS, Rocky
-./deploy.sh root@your-server-ip --env .env
+# Production:
+docker run -p 8200:8200 \
+  -e AGENTNS_API_KEYS="your-key-here" \
+  ghcr.io/tonystark3110/agentns:latest
 ```
 
-After deploy, point all your agents at the server IP:
-```python
-client = AgentNSClient("http://your-server-ip:8200")
-```
-
-Your cloud provider's firewall (AWS security group, GCP firewall rule, Linode firewall) must allow inbound TCP on port 8200. The deploy script handles OS-level firewalls (ufw / firewalld) automatically.
+Or with full stack via [`docker-compose.yml`](docker-compose.yml).
 
 ---
 
-### Sidecar (one agentns per orchestrator host)
-Agents in all regions register with the local agentns. Best for low-latency local resolution.
+## URN format
 
 ```
-┌─────────────────────────────────────────┐
-│ Orchestrator host                        │
-│  ┌────────────────┐  ┌────────────────┐ │
-│  │  orchestrator  │→ │  agentns :8200 │ │
-│  └────────────────┘  └────────────────┘ │
-└─────────────────────────────────────────┘
-         ↕ register                ↕ register
-  ┌──────────────┐          ┌──────────────┐
-  │ agent-nyc    │          │ agent-london │
-  │  :9001       │          │  :9001       │
-  └──────────────┘          └──────────────┘
+urn:{tld}:{namespace}:{label}
+    │       │           └── agent label    e.g. "alerts"
+    │       └────────────── app namespace  e.g. "my-app"
+    └────────────────────── TLD           e.g. "agents.example.com"
 ```
 
-### Centralised
-One shared agentns for the whole system. Use MongoDB to persist registrations across restarts.
+Three formats are supported:
 
-```bash
-docker run -d -p 8200:8200 \
-  -e AGENTNS_TLD="mycompany.com" \
-  -e AGENTNS_NAMESPACE="my-app" \
-  -e MONGODB_URI="mongodb+srv://user:pass@cluster/" \
-  manikandan3110/agentns:latest
-```
-
-### Embedded (Python only)
-Mount the FastAPI app directly into your own app:
-
-```python
-from fastapi import FastAPI
-from agentns.server import app as ans_app
-
-main_app = FastAPI()
-main_app.mount("/ans", ans_app)
-```
-
----
-
-## Contributing
-
-PRs welcome. Run tests with:
-
-```bash
-pip install -e ".[dev]"
-pytest tests/ -v
-```
+| Format | Example |
+|--------|---------|
+| URN (recommended) | `urn:agents.example.com:my-app:alerts` |
+| Email-like | `alerts.my-app#agents.example.com` |
+| DNS-like | `_alerts._my-app.agent.agents.example.com` |
 
 ---
 
 ## License
 
-MIT © 2025 DataWorksAI
+MIT — see [LICENSE](LICENSE).
