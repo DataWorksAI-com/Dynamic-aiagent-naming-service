@@ -56,9 +56,7 @@ __version__ = "2.0.0"
 __author__  = "DataWorksAI"
 __license__ = "MIT"
 
-# ── Top-level re-exports ───────────────────────────────────────────────────────
-# Import the most commonly used types so users can write `agentns.Query` etc.
-
+# ── Requester side ─────────────────────────────────────────────────────────────
 from agentns.requester_lib import (
     connect as resolve_connect,
     AgentName,
@@ -68,18 +66,15 @@ from agentns.requester_lib import (
     RequesterAgentClient,
 )
 
+# ── Target side ────────────────────────────────────────────────────────────────
 from agentns.target_lib import (
     connect as record_connect,
     DeploymentSpec,
     TargetAgentClient,
 )
 
+# ── Sub-module aliases (agentns.requester_lib.connect() etc.) ─────────────────
 from agentns import requester_lib, target_lib
-
-# ── Backward compatibility ────────────────────────────────────────────────────
-# Code using client.py's AgentNSClient / AgentNSClientSync / ResolvedAgent
-# continues to work without changes.
-from agentns.client import AgentNSClient, AgentNSClientSync, ResolvedAgent
 
 __all__ = [
     # Requester side
@@ -95,8 +90,4 @@ __all__ = [
     "DeploymentSpec",
     "TargetAgentClient",
     "target_lib",
-    # Backward compat
-    "AgentNSClient",
-    "AgentNSClientSync",
-    "ResolvedAgent",
 ]
