@@ -1,0 +1,27 @@
+# Agentgateway config — A2A proxy for agentns
+#
+# This file is mounted into the agentgateway container.
+# It tells Agentgateway to proxy A2A traffic to the agents registered in agentns.
+#
+# Docs: https://agentgateway.dev/docs/guides/a2a-proxy
+
+listeners:
+  - name: a2a-proxy
+    port: 8400
+    protocol: HTTP
+
+routes:
+  # Proxy all /a2a/{namespace}/{label} traffic to the target agent.
+  # agentns builds this URL format automatically when AGENTNS_PROXY_HOST is set.
+  - match:
+      path_prefix: /a2a/
+    policies:
+      a2a: {}          # enable A2A proxy mode (rewrites agent card, logs methods)
+      # Uncomment to add auth:
+      # auth:
+      #   api_key:
+      #     header: X-API-Key
+      #     keys: ["your-key-here"]
+      # Uncomment to add rate limiting:
+      # rate_limit:
+      #   requests_per_minute: 60

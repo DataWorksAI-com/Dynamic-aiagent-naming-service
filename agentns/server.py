@@ -88,24 +88,41 @@ MONGODB_URI      = os.getenv("MONGODB_URI",                 "")
 MONGODB_DB       = os.getenv("MONGODB_DB",                  "agentns")
 
 # ── A2A Proxy config (optional — when set, /resolve returns proxy URL) ─────────
-# Set A2A_PROXY_ENDPOINTS to a comma-separated list of proxy base URLs.
-# When set, /resolve returns the proxy URL instead of the direct agent URL,
-# and adds slim_identity to the response for SLIM-based routing.
 #
-# Example:
-#   A2A_PROXY_ENDPOINTS=http://proxy.example.com:8400
+# Two ways to configure — use whichever fits your setup:
+#
+# Option A — High-level (recommended for Agentgateway):
+#   AGENTNS_PROXY_HOST=agentgateway       hostname or IP of the proxy
+#   AGENTNS_PROXY_PORT=8400               port (default: 8400)
+#   AGENTNS_PROXY_MODE=agentgateway       "agentgateway" (default) | "custom"
+#   SLIM_ORG=my-org                       optional SLIM org prefix
+#
+# Option B — Low-level (full manual control):
+#   A2A_PROXY_ENDPOINTS=http://proxy:8400 comma-separated proxy base URLs
 #   SLIM_ORG=my-org
 #
-# Response will include:
-#   url:           "http://proxy.example.com:8400/a2a/my-namespace/alerts"
+# When either option is set, /resolve returns:
+#   url:           "http://agentgateway:8400/a2a/my-namespace/alerts"
 #   via_proxy:     true
 #   slim_identity: "my-org/my-namespace/alerts"
-_PROXY_ENDPOINTS: List[str] = [
-    ep.strip()
-    for ep in os.getenv("A2A_PROXY_ENDPOINTS", "").split(",")
-    if ep.strip()
-]
-SLIM_ORG = os.getenv("SLIM_ORG", "")
+#
+# Agentgateway URL format:   {proxy_base}/a2a/{namespace}/{label}
+# Agentgateway docs:         https://agentgateway.dev/docs/guides/a2a-proxy
+
+_PROXY_HOST = os.getenv("AGENTNS_PROXY_HOST", "").strip()
+_PROXY_PORT = os.getenv("AGENTNS_PROXY_PORT", "8400").strip()
+_PROXY_MODE = os.getenv("AGENTNS_PROXY_MODE", "agentgateway").lower().strip()
+SLIM_ORG    = os.getenv("SLIM_ORG", "")
+
+# Build the proxy endpoints list — Option B (explicit) takes precedence over Option A (derived)
+_raw_proxy_eps = os.getenv("A2A_PROXY_ENDPOINTS", "")
+if _raw_proxy_eps:
+    _PROXY_ENDPOINTS: List[str] = [ep.strip() for ep in _raw_proxy_eps.split(",") if ep.strip()]
+elif _PROXY_HOST:
+    _proxy_scheme = "https" if _PROXY_PORT in ("443", "8443") else "http"
+    _PROXY_ENDPOINTS = [f"{_proxy_scheme}://{_PROXY_HOST}:{_PROXY_PORT}"]
+else:
+    _PROXY_ENDPOINTS = []
 
 _start_time = _time.time()
 
@@ -242,6 +259,8 @@ async def lifespan(application: FastAPI):
 
     total = sum(len(v) for v in _registry.values())
     logger.info(f"agentns ready — {total} endpoint(s) across {len(_registry)} label(s) | port {PORT}")
+    if _PROXY_ENDPOINTS:
+        logger.info(f"A2A proxy enabled — mode={_PROXY_MODE} endpoint={_PROXY_ENDPOINTS[0]}")
 
     yield
 
@@ -693,6 +712,12 @@ async def health():
         "total_labels":           len(_registry),
         "total_endpoints":        sum(len(v) for v in _registry.values()),
         "uptime_seconds":         round(_time.time() - _start_time, 1),
+        "proxy": {
+            "enabled":  bool(_PROXY_ENDPOINTS),
+            "mode":     _PROXY_MODE if _PROXY_ENDPOINTS else None,
+            "endpoint": _PROXY_ENDPOINTS[0] if _PROXY_ENDPOINTS else None,
+            "slim_org": SLIM_ORG or None,
+        },
         "geocoded_cities":        {
             city: {"lat": c[0], "lon": c[1]} if c else "failed"
             for city, c in geocache.items()
@@ -768,6 +793,7 @@ def main() -> None:
     if args.namespace != DEFAULT_NS:
         os.environ["AGENTNS_NAMESPACE"] = args.namespace
 
+    _proxy_display = _PROXY_ENDPOINTS[0] if _PROXY_ENDPOINTS else "disabled"
     print(f"""
 ╔══════════════════════════════════════════════╗
 ║          agentns  v2.0.0  starting           ║
@@ -777,6 +803,7 @@ def main() -> None:
   TLD       : {DEFAULT_TLD}
   MongoDB   : {'connected' if MONGODB_URI else 'disabled (in-memory)'}
   Health    : every {HEALTH_INTERVAL}s
+  A2A Proxy : {_proxy_display}{f'  (mode: {_PROXY_MODE})' if _PROXY_ENDPOINTS else ''}
 """)
     uvicorn.run(
         "agentns.server:app",

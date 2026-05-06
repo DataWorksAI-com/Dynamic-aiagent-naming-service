@@ -1,0 +1,74 @@
+# agentns + Agentgateway — full A2A proxy stack
+#
+# What this does:
+#   agentns      (:8200)  — service discovery, health checking, geo-routing
+#   agentgateway (:8400)  — A2A proxy: auth, rate-limiting, observability
+#
+# agentns is configured to return the Agentgateway URL when agents resolve each other.
+# All agent-to-agent traffic flows through Agentgateway automatically.
+#
+# Usage:
+#   docker compose up
+#
+# Test resolution (returns gateway URL, not direct agent URL):
+#   curl http://localhost:8200/health | jq .proxy
+#
+# Docs:
+#   agentns:      https://github.com/tonystark3110/agentns
+#   agentgateway: https://agentgateway.dev/docs/guides/a2a-proxy
+
+version: "3.9"
+
+services:
+
+  # ── agentns — service discovery ───────────────────────────────────────────────
+  agentns:
+    image: ghcr.io/tonystark3110/agentns:latest
+    ports:
+      - "8200:8200"
+    environment:
+      # Auth — change this to a real secret in production
+      AGENTNS_AUTH: "off"
+
+      # Namespace — set this to match your app
+      AGENTNS_NAMESPACE: "my-app"
+      AGENTNS_TLD: "agents.local"
+
+      # ── Agentgateway integration ──────────────────────────────────────────────
+      # Tell agentns to return the gateway URL when agents resolve each other.
+      # Uses the high-level config — no need to know the full proxy URL format.
+      AGENTNS_PROXY_HOST: "agentgateway"
+      AGENTNS_PROXY_PORT: "8400"
+      AGENTNS_PROXY_MODE: "agentgateway"
+      # Optional: SLIM org prefix for slim_identity field
+      # SLIM_ORG: "my-org"
+
+      AGENTNS_HEALTH_INTERVAL: "30"
+    depends_on:
+      - agentgateway
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request; urllib.request.urlopen('http://localhost:8200/health')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  # ── agentgateway — A2A proxy ──────────────────────────────────────────────────
+  # Intercepts all agent-to-agent traffic.
+  # Rewrites /.well-known/agent.json so agents can't bypass the proxy.
+  # Adds per-method logging (message/send, message/stream, etc.).
+  agentgateway:
+    image: ghcr.io/agentgateway/agentgateway:latest
+    ports:
+      - "8400:8400"    # A2A proxy port
+      - "9090:9090"    # Admin / metrics port (optional)
+    volumes:
+      - ./agentgateway-config.yaml:/etc/agentgateway/config.yaml:ro
+    restart: unless-stopped
+
+# ── networks ──────────────────────────────────────────────────────────────────
+# Both services share a network so agentns can reference agentgateway by hostname.
+networks:
+  default:
+    name: agentns-network

@@ -302,7 +302,10 @@ All responses include `X-Content-Type-Options`, `X-Frame-Options`, `X-XSS-Protec
 | `REGISTRY_URL` | `http://localhost:6900` | HTTP registry URL |
 | `REGISTRY_YAML` | `agents.yaml` | Static registry YAML file |
 | `REGISTRY_URLS` | *(none)* | Comma-separated URLs for multi-adapter |
-| `A2A_PROXY_ENDPOINTS` | *(none)* | Comma-separated A2A proxy base URLs |
+| `AGENTNS_PROXY_HOST` | *(none)* | Agentgateway hostname (sets proxy mode) |
+| `AGENTNS_PROXY_PORT` | `8400` | Agentgateway port |
+| `AGENTNS_PROXY_MODE` | `agentgateway` | `agentgateway` or `custom` |
+| `A2A_PROXY_ENDPOINTS` | *(none)* | Low-level override: comma-separated proxy base URLs |
 | `SLIM_ORG` | *(none)* | SLIM org prefix for `slim_identity` |
 
 **Client environment variables:**
@@ -398,6 +401,84 @@ docker run -d --restart always \
 ```
 
 Without MongoDB, agents need to re-register each time agentns restarts (which is fine — `record()` is idempotent).
+
+---
+
+## Agentgateway integration (A2A proxy)
+
+[Agentgateway](https://agentgateway.dev) is a purpose-built proxy for agent traffic. Pair it with agentns to add **auth, rate-limiting, and per-call observability** to every agent-to-agent request — without changing your agent code.
+
+```
+Requester Agent
+      │
+      │  resolve("alerts")
+      ▼
+   agentns (:8200)          ← service discovery, health, geo-routing
+      │
+      │  returns "http://agentgateway:8400/a2a/my-app/alerts"
+      ▼
+  Agentgateway (:8400)      ← auth, rate limiting, A2A method logging
+      │
+      ▼
+  Alerts Agent (:9001)      ← your real agent
+```
+
+### Quick start
+
+```bash
+cd examples/agentgateway
+docker compose up
+```
+
+That starts both services wired together. agentns automatically returns the gateway URL on every resolve — your agents don't need any code changes.
+
+### Manual config
+
+```bash
+docker run -p 8200:8200 \
+  -e AGENTNS_AUTH=off \
+  -e AGENTNS_PROXY_HOST=agentgateway \
+  -e AGENTNS_PROXY_PORT=8400 \
+  ghcr.io/tonystark3110/agentns:latest
+```
+
+| Variable | Default | Description |
+|---|---|---|
+| `AGENTNS_PROXY_HOST` | *(none)* | Agentgateway hostname or IP |
+| `AGENTNS_PROXY_PORT` | `8400` | Agentgateway port |
+| `AGENTNS_PROXY_MODE` | `agentgateway` | `agentgateway` or `custom` |
+| `SLIM_ORG` | *(none)* | Optional SLIM org prefix for `slim_identity` |
+| `A2A_PROXY_ENDPOINTS` | *(none)* | Low-level override — full proxy base URL(s), comma-separated |
+
+When proxy is configured, `/resolve` returns:
+
+```json
+{
+  "url":           "http://agentgateway:8400/a2a/my-app/alerts",
+  "via_proxy":     true,
+  "slim_identity": "my-org/my-app/alerts",
+  "metadata": {
+    "direct_endpoint": "http://real-agent:9001"
+  }
+}
+```
+
+The direct agent URL is preserved in `metadata.direct_endpoint` for debugging.
+
+### Verify proxy is active
+
+```bash
+curl http://localhost:8200/health | jq .proxy
+```
+
+```json
+{
+  "enabled":  true,
+  "mode":     "agentgateway",
+  "endpoint": "http://agentgateway:8400",
+  "slim_org": null
+}
+```
 
 ---
 
