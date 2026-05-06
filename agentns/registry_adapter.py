@@ -36,9 +36,15 @@ Implement two methods and you're done:
         async def health(self):
             return {"status": "ok"}
 
-    # Wire it into the server:
-    from agentns import server
-    server.set_registry_adapter(ConsulAdapter())
+    # Use the adapter directly (e.g. in your own resolver service or scripts):
+    adapter = ConsulAdapter()
+    result  = await adapter.resolve("my-app:alerts", {"protocols": ["A2A"]})
+
+Note: adapters are standalone components. The built-in agentns server uses
+its own in-memory registry (agents POST to /register directly). Adapters are
+useful when you want to build a *custom resolver* that looks up agents in an
+existing external registry (Consul, etcd, k8s) rather than having agents
+self-register with agentns.
 
 Registry HTTP Contract
 ----------------------

@@ -16,8 +16,8 @@ agentns selects the best replica based on:
   4. Load (CPU %)
 
 Run this example:
-    # Start agentns
-    docker run -p 8200:8200 agentns:latest
+    # Start agentns (dev mode — no auth key needed)
+    AGENTNS_AUTH=off agentns-server --port 8200
 
     # Run the demo
     python examples/mbta_transit_example.py
@@ -25,7 +25,7 @@ Run this example:
 
 import asyncio
 import os
-from agentns.client import AgentNSClient
+import agentns
 
 AGENTNS_URL = os.getenv("AGENTNS_URL", "http://localhost:8200")
 
@@ -34,99 +34,131 @@ NS  = "mbta-transit-ci"
 TLD = "agents.dataworksai.com"
 
 
-async def setup_mbta_agents(client: AgentNSClient):
+async def setup_mbta_agents(reg_client: agentns.TargetAgentClient):
     """Register all MBTA agents (Boston primary + Frankfurt replica)."""
     print("Registering MBTA agents...\n")
 
     agents = [
         # alerts — Boston primary
-        dict(label="alerts", endpoint="http://96.126.111.107:8001",
-             namespace=NS, region="us-east", location={"city": "Boston"},
-             protocols=["A2A", "SLIM"], flag="🇺🇸",
-             health_check_url="http://96.126.111.107:8001/.well-known/agent.json"),
-
+        agentns.DeploymentSpec(
+            leaf_name  = "alerts",
+            a2a_url    = "http://96.126.111.107:8001",
+            health_url = "http://96.126.111.107:8001/.well-known/agent.json",
+            region     = "us-east",
+            location   = {"city": "Boston"},
+            protocols  = ["A2A", "SLIM"],
+            flag       = "🇺🇸",
+        ),
         # planner — Boston primary
-        dict(label="planner", endpoint="http://96.126.111.107:8002",
-             namespace=NS, region="us-east", location={"city": "Boston"},
-             protocols=["A2A", "SLIM"], flag="🇺🇸",
-             health_check_url="http://96.126.111.107:8002/.well-known/agent.json"),
-
+        agentns.DeploymentSpec(
+            leaf_name  = "planner",
+            a2a_url    = "http://96.126.111.107:8002",
+            health_url = "http://96.126.111.107:8002/.well-known/agent.json",
+            region     = "us-east",
+            location   = {"city": "Boston"},
+            protocols  = ["A2A", "SLIM"],
+            flag       = "🇺🇸",
+        ),
         # stopfinder — Boston primary
-        dict(label="stopfinder", endpoint="http://96.126.111.107:8003",
-             namespace=NS, region="us-east", location={"city": "Boston"},
-             protocols=["A2A", "SLIM"], flag="🇺🇸",
-             health_check_url="http://96.126.111.107:8003/.well-known/agent.json"),
-
+        agentns.DeploymentSpec(
+            leaf_name  = "stopfinder",
+            a2a_url    = "http://96.126.111.107:8003",
+            health_url = "http://96.126.111.107:8003/.well-known/agent.json",
+            region     = "us-east",
+            location   = {"city": "Boston"},
+            protocols  = ["A2A", "SLIM"],
+            flag       = "🇺🇸",
+        ),
         # fares — Boston primary
-        dict(label="fares", endpoint="http://192.168.1.50:8004",
-             namespace=NS, region="us-east", location={"city": "Boston"},
-             protocols=["A2A"], flag="🇺🇸"),
-
-        # fares — Frankfurt replica  (auto-failover if Boston is down)
-        dict(label="fares", endpoint="http://lin-de-fra1.example.com:8004",
-             namespace=NS, region="eu-central", location={"city": "Frankfurt"},
-             protocols=["A2A"], flag="🇩🇪"),
+        agentns.DeploymentSpec(
+            leaf_name = "fares",
+            a2a_url   = "http://192.168.1.50:8004",
+            region    = "us-east",
+            location  = {"city": "Boston"},
+            protocols = ["A2A"],
+            flag      = "🇺🇸",
+        ),
+        # fares — Frankfurt replica (auto-failover if Boston is down)
+        agentns.DeploymentSpec(
+            leaf_name = "fares",
+            a2a_url   = "http://lin-de-fra1.example.com:8004",
+            region    = "eu-central",
+            location  = {"city": "Frankfurt"},
+            protocols = ["A2A"],
+            flag      = "🇩🇪",
+        ),
     ]
 
-    for a in agents:
-        result = await client.register(**a)
-        print(f"  {result['status']:10s} {a['label']:12s} @ {a['endpoint']}")
+    for spec in agents:
+        result = await reg_client.record(spec)
+        print(f"  {result['status']:10s} {spec.leaf_name:12s} @ {spec.a2a_url}")
 
     print()
 
 
-async def resolve_for_user(client: AgentNSClient, agent: str, user_city: str):
+async def resolve_for_user(
+    res_client: agentns.RequesterAgentClient,
+    agent_label: str,
+    user_city: str,
+):
     """Simulate an end-user request from user_city."""
-    urn = f"urn:{TLD}:{NS}:{agent}"
-    resolved = await client.resolve(
-        urn,
-        requester_context={
-            "protocols": ["A2A"],
-            "location":  {"city": user_city},
-        },
+    query = agentns.Query(
+        agent_name        = agentns.AgentName.from_parts(TLD, NS, agent_label),
+        requester_context = agentns.RequesterContext(
+            protocols = ["A2A"],
+            location  = {"city": user_city},
+        ),
     )
+    resolved = await res_client.resolve(query)
 
     if resolved:
         print(
-            f"  {agent:12s} | user in {user_city:12s} → "
+            f"  {agent_label:12s} | user in {user_city:12s} → "
             f"{resolved.flag} {resolved.region:18s} | "
             f"{resolved.metadata.get('latency_ms', '?'):>5}ms | "
             f"{resolved.selected_by}"
         )
     else:
-        print(f"  {agent:12s} | user in {user_city:12s} → RESOLUTION FAILED")
+        print(f"  {agent_label:12s} | user in {user_city:12s} → RESOLUTION FAILED")
 
 
 async def main():
-    async with AgentNSClient(AGENTNS_URL) as client:
-        # Check sidecar is up
-        h = await client.health()
-        print(f"agentns {h['status']} — {h['total_endpoints']} endpoint(s) loaded\n")
+    # One client for registration (target side)
+    reg_client = agentns.record_connect(ns_url=AGENTNS_URL)
 
-        await setup_mbta_agents(client)
+    # One client for resolution (requester side)
+    res_client = agentns.resolve_connect(resolver_url=AGENTNS_URL)
 
-        # Simulate resolutions from different cities
-        print("Resolving agents for different user locations:")
-        print(f"  {'Agent':12s} | {'User location':24s} | {'Latency':>5s} | Selected by")
-        print("  " + "─" * 70)
+    # Check sidecar is up
+    h = await res_client.health()
+    print(f"agentns {h.get('status', 'unknown')} — "
+          f"{h.get('total_endpoints', 0)} endpoint(s) loaded\n")
 
-        test_cases = [
-            ("alerts",     "Boston"),
-            ("planner",    "New York"),
-            ("stopfinder", "Chicago"),
-            ("fares",      "Boston"),      # should pick Boston fares
-            ("fares",      "Frankfurt"),   # should pick Frankfurt fares
-            ("fares",      "London"),      # geographically closer to Frankfurt
-        ]
-        for agent, city in test_cases:
-            await resolve_for_user(client, agent, city)
+    await setup_mbta_agents(reg_client)
 
-        print()
+    # Simulate resolutions from different cities
+    print("Resolving agents for different user locations:")
+    print(f"  {'Agent':12s} | {'User location':24s} | {'Latency':>5s} | Selected by")
+    print("  " + "─" * 70)
 
-        # Cache stats after all resolutions
-        stats = await client._client.get("/cache/stats")
-        s = stats.json()
-        print(f"Cache: {s['hits']} hits / {s['misses']} misses ({s['hit_rate_pct']}% hit rate)")
+    test_cases = [
+        ("alerts",     "Boston"),
+        ("planner",    "New York"),
+        ("stopfinder", "Chicago"),
+        ("fares",      "Boston"),      # should pick Boston fares
+        ("fares",      "Frankfurt"),   # should pick Frankfurt fares
+        ("fares",      "London"),      # geographically closer to Frankfurt
+    ]
+    for agent_label, city in test_cases:
+        await resolve_for_user(res_client, agent_label, city)
+
+    print()
+
+    # Cache stats after all resolutions
+    stats = await res_client.health()
+    print(f"agentns health: {stats.get('status')} | "
+          f"{stats.get('total_labels', 0)} labels | "
+          f"{stats.get('total_endpoints', 0)} endpoints")
 
 
 asyncio.run(main())

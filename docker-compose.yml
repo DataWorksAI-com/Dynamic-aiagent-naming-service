@@ -22,6 +22,11 @@ services:
       AGENTNS_HEALTH_INTERVAL: "${AGENTNS_HEALTH_INTERVAL:-30}"
       MONGODB_URI:             "${MONGODB_URI:-}"        # empty = in-memory mode
       MONGODB_DB:              "${MONGODB_DB:-agentns}"
+      # Auth — set AGENTNS_AUTH=off for local dev (no API key required).
+      # For production set AGENTNS_AUTH=on and provide AGENTNS_API_KEYS.
+      # Generate a key: python -c "import secrets; print(secrets.token_urlsafe(32))"
+      AGENTNS_AUTH:            "${AGENTNS_AUTH:-off}"
+      AGENTNS_API_KEYS:        "${AGENTNS_API_KEYS:-}"
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "python", "-c",
