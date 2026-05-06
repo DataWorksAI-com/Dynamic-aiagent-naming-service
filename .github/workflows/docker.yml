@@ -7,12 +7,15 @@ on:
   pull_request:
     branches: [master]
 
+# Grant GITHUB_TOKEN permission to push to GHCR.
+# Must be at workflow level to override repo-wide default (which is read-only).
+permissions:
+  contents: read
+  packages: write
+
 jobs:
   docker:
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      packages: write
 
     steps:
       - name: Checkout
@@ -35,7 +38,7 @@ jobs:
             type=ref,event=branch
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
-            type=raw,value=latest,enable={{is_default_branch}}
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/master' }}
 
       - name: Build and push
         uses: docker/build-push-action@v5
