@@ -52,6 +52,10 @@ services:
       AGENTNS_GEOCODING:       "${AGENTNS_GEOCODING:-on}"
       MONGODB_URI:             "${MONGODB_URI:-}"
       MONGODB_DB:              "${MONGODB_DB:-agentns}"
+      # Auth is enforced in production — must set AGENTNS_API_KEYS in .env
+      # Generate: python -c "import secrets; print(secrets.token_urlsafe(32))"
+      AGENTNS_AUTH:            "${AGENTNS_AUTH:-on}"
+      AGENTNS_API_KEYS:        "${AGENTNS_API_KEYS}"
 
     # ── tighter healthcheck in production ─────────────────────────────────────
     healthcheck:

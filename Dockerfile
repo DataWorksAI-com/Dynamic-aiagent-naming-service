@@ -33,16 +33,18 @@ FROM python:3.12-slim
 
 LABEL org.opencontainers.image.title="agentns"
 LABEL org.opencontainers.image.description="Agent Name Service sidecar for multi-agent systems"
-LABEL org.opencontainers.image.version="1.0.0"
+LABEL org.opencontainers.image.version="2.0.0"
 LABEL org.opencontainers.image.licenses="MIT"
-LABEL org.opencontainers.image.source="https://github.com/DataWorksAI-com/Dynamic-ans"
+LABEL org.opencontainers.image.source="https://github.com/tonystark3110/agentns"
 
 WORKDIR /app
 
-# Copy wheel from builder and install (with optional mongo extras)
+# Copy wheel from builder and install with all optional server extras
 COPY --from=builder /dist/*.whl /tmp/
-RUN pip install --no-cache-dir /tmp/agentns-*.whl "agentns[mongo] @ /tmp/agentns-1.0.0-py3-none-any.whl" 2>/dev/null || \
-    pip install --no-cache-dir /tmp/agentns-*.whl motor>=3.4.0
+RUN pip install --no-cache-dir /tmp/agentns-*.whl \
+    "motor>=3.4.0" \
+    "slowapi>=0.1.9" \
+    "pyyaml>=6.0"
 
 # Create non-root user
 RUN useradd -r -s /bin/false agentns
@@ -54,6 +56,10 @@ ENV AGENTNS_NAMESPACE=agents.local
 ENV AGENTNS_TLD=agentns.local
 ENV AGENTNS_HEALTH_INTERVAL=30
 ENV AGENTNS_GEOCODING=on
+# Auth: off by default so bare `docker run agentns:latest` works immediately.
+# For production override at runtime:
+#   docker run -e AGENTNS_AUTH=on -e AGENTNS_API_KEYS="your-key" agentns:latest
+ENV AGENTNS_AUTH=off
 # MONGODB_URI — set at runtime if persistence is needed
 
 EXPOSE 8200

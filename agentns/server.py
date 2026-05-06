@@ -53,6 +53,32 @@ logging.basicConfig(
 )
 logger = logging.getLogger("agentns")
 
+# ── rate limiting (optional — requires slowapi) ────────────────────────────────
+# Import early so _limit() is available as a decorator on route functions.
+try:
+    from slowapi import Limiter, _rate_limit_exceeded_handler
+    from slowapi.errors import RateLimitExceeded
+    from slowapi.util import get_remote_address
+    _limiter = Limiter(key_func=get_remote_address)
+    _RATE_LIMIT_AVAILABLE = True
+except ImportError:
+    _limiter = None
+    _RATE_LIMIT_AVAILABLE = False
+
+
+def _limit(rate: str):
+    """
+    Return a slowapi rate-limit decorator if slowapi is installed, otherwise a no-op.
+
+    Usage:
+        @app.post("/resolve", dependencies=[Depends(verify_api_key)])
+        @_limit("60/minute")
+        async def resolve(request: Request, body: dict): ...
+    """
+    if _limiter is not None:
+        return _limiter.limit(rate)
+    return lambda f: f
+
 # ── config from env ────────────────────────────────────────────────────────────
 PORT             = int(os.getenv("AGENTNS_PORT",            "8200"))
 DEFAULT_NS       = os.getenv("AGENTNS_NAMESPACE",           "agents.local")
@@ -242,21 +268,13 @@ app = FastAPI(
 # ── Security headers middleware ────────────────────────────────────────────────
 app.middleware("http")(security_headers_middleware)
 
-
-# ── Rate limiting (optional — requires slowapi) ────────────────────────────────
-try:
-    from slowapi import Limiter, _rate_limit_exceeded_handler
-    from slowapi.errors import RateLimitExceeded
-    from slowapi.util import get_remote_address
-
-    _limiter = Limiter(key_func=get_remote_address)
+# ── Wire slowapi into app (noop if slowapi not installed) ─────────────────────
+if _RATE_LIMIT_AVAILABLE:
     app.state.limiter = _limiter
     app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
-    _RATE_LIMIT_AVAILABLE = True
     logger.info("Rate limiting enabled (slowapi)")
-except ImportError:
-    _RATE_LIMIT_AVAILABLE = False
-    logger.warning("slowapi not installed — rate limiting disabled. pip install slowapi")
+else:
+    logger.warning("slowapi not installed — rate limiting disabled. pip install agentns[server]")
 
 
 # ── Proxy helpers ─────────────────────────────────────────────────────────────
@@ -302,6 +320,7 @@ def _build_proxy_response(result: Dict, label: str, namespace: str) -> Dict:
 # ── POST /resolve ──────────────────────────────────────────────────────────────
 
 @app.post("/resolve", dependencies=[Depends(verify_api_key)])
+@_limit("60/minute")
 async def resolve(request: Request, body: dict):
     """
     Resolve an agent by URN or label.
@@ -498,6 +517,7 @@ async def resolve(request: Request, body: dict):
 # ── POST /register ─────────────────────────────────────────────────────────────
 
 @app.post("/register", status_code=200, dependencies=[Depends(verify_api_key)])
+@_limit("60/minute")
 async def register(request: Request, body: dict):
     """
     Register an agent endpoint.
@@ -714,6 +734,7 @@ async def cache_stats():
 
 
 @app.post("/cache/clear", dependencies=[Depends(verify_api_key)])
+@_limit("5/minute")
 async def cache_clear(request: Request):
     count = await _cache.clear()
     return {"status": "cleared", "entries_removed": count}
