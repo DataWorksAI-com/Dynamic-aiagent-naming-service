@@ -1,6 +1,6 @@
 # agentns — Technical Reference
 
-**Version:** 1.0.0  
+**Version:** 2.0.0  
 **Organization:** DataWorksAI  
 **License:** MIT
 
@@ -1115,75 +1115,45 @@ Convenience function. Calls `parse_urn()` and returns `.label`. If label is empt
 
 ---
 
-### 5.6 `client.py` — Python Client SDK
+### 5.6 Python Client SDK
 
-**File:** `agentns/client.py`  
-**Purpose:** Type-safe Python client for calling the agentns sidecar. Two classes: async (`AgentNSClient`) and sync wrapper (`AgentNSClientSync`).
+The Python SDK is split into two modules:
 
-#### `ResolvedAgent` dataclass
+| Module | Purpose |
+|--------|---------|
+| `agentns/requester_lib.py` | Resolve other agents — use when you want to **call** someone |
+| `agentns/target_lib.py` | Register yourself — use when you **are** the target |
 
-The typed return value from `client.resolve()`.
+#### `requester_lib` — resolve agents
 
-| Field | Type | Description |
-|-------|------|-------------|
-| `endpoint` | str | Full URL of the selected agent |
-| `protocol` | str | Selected protocol (e.g. "A2A", "http") |
-| `ttl` | int | Seconds until resolution should be refreshed |
-| `region` | str | Human-readable region name |
-| `cached` | bool | True if served from cache |
-| `selected_by` | str | Selection reason |
-| `resolution_time_ms` | float | Total round-trip time in ms |
-| `metadata` | dict | Candidate list, latency, total_candidates |
-| `flag` | str | Emoji flag |
-| `endpoint_url` | property | Alias for `endpoint` (backward compatibility) |
+Key types: `AgentName`, `RequesterContext`, `Query`, `TailoredEndpoint`, `RequesterAgentClient`
 
----
-
-#### `AgentNSClient` (async)
-
-Initialized with `url` (defaults to `AGENTNS_URL` env var) and `timeout` (default 5s). Creates a persistent `httpx.AsyncClient` with JSON headers pre-set.
-
-**`resolve(agent_name, *, requester_context, cache_enabled) → Optional[ResolvedAgent]`**
-
-- Never raises. On any error (network, 4xx, 5xx, JSON decode): returns `None`.
-- Caller is expected to implement fallback logic when `None` is returned.
-- Wraps the response JSON into a typed `ResolvedAgent` dataclass.
-
-**`register(label, endpoint, **kwargs) → Dict`**
-
-- Raises `httpx.HTTPStatusError` (via `raise_for_status()`) on server errors.
-- Caller should catch on startup and retry or abort.
-
-**`deregister(label, endpoint="") → Dict`**
-
-- Empty `endpoint` deregisters all replicas for the label.
-- Raises on HTTP error.
-
-**`health() → Dict`**  
-**`agents() → Dict`**
-
-- Direct passthrough to `/health` and `/agents` endpoints.
-
-**Context manager protocol** (`async with AgentNSClient(...) as c:`):
-- `__aenter__` returns `self`.
-- `__aexit__` calls `self._client.aclose()` — important for connection cleanup.
-- Can also call `await client.close()` manually.
-
----
-
-#### `AgentNSClientSync`
-
-A synchronous convenience wrapper. Each method call wraps the async equivalent in `asyncio.run()`:
-
+Entry point:
 ```python
-def resolve(self, agent_name, **kwargs):
-    async def _go():
-        async with AgentNSClient(self._url, self._timeout) as c:
-            return await c.resolve(agent_name, **kwargs)
-    return asyncio.run(_go())
+client = agentns.requester_lib.connect()   # reads AGENTNS_URL + AGENTNS_API_KEY from env
+endpoint = await client.resolve(agentns.Query.from_label("alerts"))
 ```
 
-Creates and destroys an event loop per call. Fine for scripts, agent startup/shutdown code, and testing. Not suitable for high-throughput production paths — use `AgentNSClient` with `await` in those cases.
+`resolve()` never raises — returns `None` on any failure so the caller can implement its own fallback.
+
+#### `target_lib` — register agents
+
+Key types: `DeploymentSpec`, `TargetAgentClient`
+
+Entry point:
+```python
+client = agentns.target_lib.connect()   # reads AGENTNS_URL + AGENTNS_API_KEY from env
+await client.record(agentns.DeploymentSpec(leaf_name="alerts", a2a_url="http://host:9001"))
+```
+
+`record()` retries automatically (default 3 attempts, 2s backoff) — safe to call at agent startup
+even if agentns is still initializing.
+
+`deregister()` passes the endpoint as a URL query parameter (not a request body) so it works
+reliably through cloud HTTP proxies that strip DELETE request bodies.
+
+See the module docstrings in [`agentns/requester_lib.py`](agentns/requester_lib.py) and
+[`agentns/target_lib.py`](agentns/target_lib.py) for full API reference.
 
 ---
 
@@ -1641,4 +1611,4 @@ agentns is a sidecar — one instance per orchestrator host. It is not designed 
 
 ---
 
-*Technical Reference — agentns v1.0.0 — DataWorksAI — MIT License*
+*Technical Reference — agentns v2.0.0 — DataWorksAI — MIT License*

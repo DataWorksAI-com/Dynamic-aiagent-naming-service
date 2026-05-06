@@ -155,6 +155,21 @@ async def test_deregister_specific(client):
 
 
 @pytest.mark.asyncio
+async def test_deregister_via_query_param(client):
+    """DELETE /register/label?endpoint=... (cloud proxy-safe path)."""
+    await client.post("/register", json={"label": "emailer", "endpoint": "http://nyc:9001"})
+    await client.post("/register", json={"label": "emailer", "endpoint": "http://lon:9001"})
+
+    resp = await client.request(
+        "DELETE", "/register/emailer",
+        params={"endpoint": "http://nyc:9001"},   # query param, no body
+    )
+    assert resp.status_code == 200
+    assert resp.json()["removed"] == 1
+    assert len(_registry["emailer"]) == 1
+
+
+@pytest.mark.asyncio
 async def test_deregister_all(client):
     await client.post("/register", json={"label": "emailer", "endpoint": "http://nyc:9001"})
     resp = await client.request("DELETE", "/register/emailer", json={})

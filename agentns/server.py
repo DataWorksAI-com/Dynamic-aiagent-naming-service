@@ -613,19 +613,28 @@ async def register(request: Request, body: dict):
 # ── DELETE /register/{label} ───────────────────────────────────────────────────
 
 @app.delete("/register/{label}", dependencies=[Depends(verify_api_key)])
-async def deregister(request: Request, label: str, body: Optional[Dict] = None):
+async def deregister(
+    request: Request,
+    label: str,
+    endpoint: Optional[str] = None,   # query param: DELETE /register/emailer?endpoint=http://...
+    body: Optional[Dict] = None,       # body:        {"endpoint": "http://..."}
+):
     """
     Deregister one or all endpoints for *label*.
 
-    Body (optional):
-        { "endpoint": "http://host:8080" }   — remove specific endpoint
-        {}                                   — remove all endpoints for label
+    Endpoint can be supplied two ways (query param is preferred — more reliable
+    through cloud proxies that strip DELETE request bodies):
+
+        DELETE /register/emailer?endpoint=http%3A//host%3A8080   (query param)
+        DELETE /register/emailer  {"endpoint": "http://host:8080"} (body)
+
+    Omit endpoint entirely to remove ALL endpoints for the label.
     """
     if label not in _registry:
         raise HTTPException(status_code=404, detail=f"Label '{label}' not found")
 
-    body     = body or {}
-    endpoint = (body.get("endpoint") or "").strip()
+    # Query param takes precedence over body; fall back to body for backward compat
+    endpoint = (endpoint or (body or {}).get("endpoint") or "").strip()
 
     if endpoint:
         before = len(_registry[label])

@@ -7,7 +7,7 @@ Call this from your agent's startup code so other agents can discover it.
 
 Prerequisites:
     pip install agentns
-    agentns-server --port 8200   (in another terminal)
+    AGENTNS_AUTH=off agentns-server --port 8200   (in another terminal)
 
 Environment (optional — defaults work for local dev):
     AGENTNS_URL=http://localhost:8200

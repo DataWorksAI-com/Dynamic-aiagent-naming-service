@@ -215,7 +215,7 @@ class ConsulAdapter(RegistryAdapter):
         return {"status": "ok"}
 ```
 
-See the [registry adapter docs](agentns/registry_adapter.py) for Consul, Kubernetes, and multi-registry examples.
+See [`examples/custom_registry_adapter.py`](examples/custom_registry_adapter.py) for runnable Consul, Kubernetes, and multi-registry examples.
 
 ---
 
@@ -314,6 +314,90 @@ All responses include `X-Content-Type-Options`, `X-Frame-Options`, `X-XSS-Protec
 | `AGENTNS_API_KEY` | *(none)* | Client API key |
 | `ANS_TLD` | `agentns.local` | TLD for `AgentName.from_label()` |
 | `ANS_APP` | `default` | Namespace for `AgentName.from_label()` |
+
+---
+
+## Cloud deployment
+
+> Agents running on AWS, GCP, Azure, or any cloud provider — here's the setup.
+
+### Step 1 — Deploy agentns on one server
+
+Pick any VM your agents can reach. Run the one-line deploy script:
+
+```bash
+./deploy.sh root@your-server-ip
+```
+
+Or use Docker:
+
+```bash
+# On your server:
+export AGENTNS_API_KEYS="$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')"
+
+docker run -d --restart always \
+  -p 8200:8200 \
+  -e AGENTNS_API_KEYS="$AGENTNS_API_KEYS" \
+  ghcr.io/tonystark3110/agentns:latest
+```
+
+Open port 8200 in your firewall/security group.
+
+### Step 2 — Configure every agent
+
+Set two environment variables on every cloud agent (in ECS task definitions, Kubernetes secrets, Lambda env, etc.):
+
+```bash
+AGENTNS_URL=http://your-server-ip:8200
+AGENTNS_API_KEY=<the key you generated above>
+```
+
+### Step 3 — Register with your public endpoint
+
+Each agent must register with the URL **other agents can reach it at** — not `localhost`:
+
+```python
+import agentns, os
+
+client = agentns.target_lib.connect()   # reads AGENTNS_URL + AGENTNS_API_KEY from env
+
+await client.record(agentns.DeploymentSpec(
+    leaf_name  = "alerts",
+    a2a_url    = f"http://{os.environ['MY_PUBLIC_IP']}:9001",   # ← public IP/hostname
+    health_url = f"http://{os.environ['MY_PUBLIC_IP']}:9001/health",
+    region     = "us-east",
+    location   = {"city": "Boston"},
+    protocols  = ["A2A"],
+))
+```
+
+> **Note:** `record()` retries automatically (3× with 2s backoff) — safe to call at startup
+> even if agentns finishes initializing a few seconds after your agent.
+
+### Step 4 — Resolve from any agent
+
+```python
+client   = agentns.resolve_connect()   # reads AGENTNS_URL + AGENTNS_API_KEY from env
+endpoint = await client.resolve(agentns.Query.from_label("alerts"))
+
+if endpoint:
+    # endpoint.url is the public URL of the best healthy instance
+    resp = await httpx.AsyncClient().post(endpoint.url, json={...})
+```
+
+### Persistence across restarts
+
+Add MongoDB so the registry survives agentns restarts (agents don't need to re-register):
+
+```bash
+docker run -d --restart always \
+  -p 8200:8200 \
+  -e AGENTNS_API_KEYS="$AGENTNS_API_KEYS" \
+  -e MONGODB_URI="mongodb+srv://user:pass@cluster.mongodb.net/" \
+  ghcr.io/tonystark3110/agentns:latest
+```
+
+Without MongoDB, agents need to re-register each time agentns restarts (which is fine — `record()` is idempotent).
 
 ---
 

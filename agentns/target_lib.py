@@ -34,11 +34,15 @@ Environment variables
 
 from __future__ import annotations
 
+import asyncio
+import logging
 import os
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
 import httpx
+
+logger = logging.getLogger("agentns.target")
 
 
 # ── DeploymentSpec ─────────────────────────────────────────────────────────────
@@ -121,15 +125,32 @@ class TargetAgentClient:
 
     # ── record (register) ──────────────────────────────────────────────────────
 
-    async def record(self, spec: DeploymentSpec) -> Dict:
+    async def record(
+        self,
+        spec: DeploymentSpec,
+        *,
+        retries: int = 3,
+        retry_delay: float = 2.0,
+    ) -> Dict:
         """
         Register this agent's endpoint with the nameservice.
 
         Idempotent — if the same endpoint is already registered, it updates it.
         Call this at agent startup and after any config change.
 
+        Retries automatically on network errors (useful when agentns is still
+        starting up and the agent races to register). Set ``retries=1`` to
+        disable retry behaviour.
+
+        Parameters
+        ----------
+        spec:        The agent's deployment descriptor.
+        retries:     Total attempts before raising (default: 3).
+        retry_delay: Base delay between attempts in seconds (default: 2.0).
+                     Each attempt waits ``retry_delay × attempt_number``.
+
         Returns the server's registration response dict.
-        Raises httpx.HTTPStatusError on failure.
+        Raises the last exception if all attempts fail.
         """
         payload = {
             "label":             spec.leaf_name,
@@ -140,10 +161,23 @@ class TargetAgentClient:
             "protocols":         spec.protocols,
             "flag":              spec.flag,
         }
-        async with httpx.AsyncClient(timeout=self.timeout, headers=self._headers) as client:
-            resp = await client.post(f"{self.ns_url}/register", json=payload)
-            resp.raise_for_status()
-            return resp.json()
+        last_exc: Exception = RuntimeError("record() called with retries=0")
+        for attempt in range(1, retries + 1):
+            try:
+                async with httpx.AsyncClient(timeout=self.timeout, headers=self._headers) as client:
+                    resp = await client.post(f"{self.ns_url}/register", json=payload)
+                    resp.raise_for_status()
+                    return resp.json()
+            except Exception as exc:
+                last_exc = exc
+                if attempt < retries:
+                    wait = retry_delay * attempt
+                    logger.warning(
+                        f"Registration attempt {attempt}/{retries} failed "
+                        f"({exc}) — retrying in {wait:.0f}s"
+                    )
+                    await asyncio.sleep(wait)
+        raise last_exc
 
     # ── deregister ────────────────────────────────────────────────────────────
 
@@ -157,11 +191,18 @@ class TargetAgentClient:
         ----------
         leaf_name: Agent label (e.g. "alerts")
         a2a_url:   Specific endpoint to remove. If empty, removes ALL endpoints for label.
+
+        Note: the endpoint is sent as a query parameter (not a request body) so
+        it is not silently dropped by cloud HTTP proxies (AWS ALB, Cloudflare, etc.)
+        that strip DELETE request bodies.
         """
-        body = {"endpoint": a2a_url} if a2a_url else {}
+        # Pass endpoint as a query param — more reliable than DELETE body across proxies
+        params = {"endpoint": a2a_url} if a2a_url else {}
         async with httpx.AsyncClient(timeout=self.timeout, headers=self._headers) as client:
             resp = await client.request(
-                "DELETE", f"{self.ns_url}/register/{leaf_name}", json=body
+                "DELETE",
+                f"{self.ns_url}/register/{leaf_name}",
+                params=params,
             )
             resp.raise_for_status()
             return resp.json()
@@ -169,11 +210,19 @@ class TargetAgentClient:
     # ── health ────────────────────────────────────────────────────────────────
 
     async def health(self) -> Dict:
-        """Check the nameservice's own health. Does not require authentication."""
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
-            resp = await client.get(f"{self.ns_url}/health")
-            resp.raise_for_status()
-            return resp.json()
+        """
+        Check the nameservice's own health.
+
+        Does not require authentication.
+        Never raises — returns ``{"status": "error", "error": "..."}`` on failure.
+        """
+        try:
+            async with httpx.AsyncClient(timeout=self.timeout) as client:
+                resp = await client.get(f"{self.ns_url}/health")
+                resp.raise_for_status()
+                return resp.json()
+        except Exception as exc:
+            return {"status": "error", "error": str(exc)}
 
 
 # ── connect() factory ──────────────────────────────────────────────────────────
