@@ -274,8 +274,8 @@ app = FastAPI(
         "Single-binary service discovery sidecar for multi-agent systems.\n\n"
         "Register agents with POST /register. Resolve them with POST /resolve using "
         "standard URNs (urn:tld:namespace:label). Language-agnostic HTTP API.\n\n"
-        "**Authentication:** POST endpoints require `X-API-Key` header when "
-        "`AGENTNS_AUTH=on` (default). GET endpoints are always open."
+        "No authentication required — designed for sidecar/internal network deployments. "
+        "For public deployments, place behind a reverse proxy that handles auth at the edge."
     ),
     version="2.0.0",
     lifespan=lifespan,
