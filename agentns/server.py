@@ -450,9 +450,10 @@ async def resolve(request: Request, body: dict):
 
     # ── emergency fallback ────────────────────────────────────────────────────
     if not ranked:
-        ep       = servers[0]
-        protocol = select_protocol(ep["protocols"], preferred_protocols)
-        result   = {
+        ep        = servers[0]
+        protocol  = select_protocol(ep["protocols"], preferred_protocols)
+        namespace = ep.get("namespace", DEFAULT_NS)
+        result    = {
             "endpoint":     ep["endpoint"],
             "protocol":     protocol,
             "ttl":          5,
@@ -467,6 +468,7 @@ async def resolve(request: Request, body: dict):
                 "all_candidates":   all_candidates,
             },
         }
+        result = _build_proxy_response(result, label, namespace)
         return result
 
     best_server, best_health = ranked[0]
@@ -497,10 +499,11 @@ async def resolve(request: Request, body: dict):
         },
     }
 
-    # Store with agent_name tag so invalidate() can find it
+    # Store with agent_name tag so invalidate() can find it.
+    # Use a copy so the pop below doesn't remove the tag from the stored payload.
     result["_cache_key_agent"] = label
     if cache_enabled:
-        await _cache.set(cache_key, result, ttl)
+        await _cache.set(cache_key, dict(result), ttl)
     result.pop("_cache_key_agent", None)
 
     # Enrich with proxy URL + slim_identity when A2A_PROXY_ENDPOINTS is configured

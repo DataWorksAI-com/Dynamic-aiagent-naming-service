@@ -1,7 +1,7 @@
 """Integration tests for the agentns FastAPI server."""
 import pytest
 from httpx import AsyncClient, ASGITransport
-from agentns.server import app, _registry, _health_cache
+from agentns.server import app, _registry, _health_cache, _cache
 
 
 @pytest.fixture(autouse=True)
@@ -9,9 +9,11 @@ async def clear_state():
     """Reset global state between tests."""
     _registry.clear()
     _health_cache.clear()
+    await _cache.clear()
     yield
     _registry.clear()
     _health_cache.clear()
+    await _cache.clear()
 
 
 @pytest.fixture
@@ -174,6 +176,32 @@ async def test_cache_clear(client):
     resp = await client.post("/cache/clear")
     assert resp.status_code == 200
     assert resp.json()["status"] == "cleared"
+
+
+@pytest.mark.asyncio
+async def test_resolve_always_has_url_field(client):
+    """Resolved response must always include 'url' regardless of health status."""
+    await client.post("/register", json={"label": "emailer", "endpoint": "http://test:9001"})
+    _health_cache["http://test:9001"] = {
+        "status": "healthy", "load": 30.0, "response_time_ms": 50.0, "last_check": "now"
+    }
+    resp = await client.post("/resolve", json={"label": "emailer"})
+    assert resp.status_code == 200
+    assert "url" in resp.json()
+
+
+@pytest.mark.asyncio
+async def test_resolve_emergency_fallback_has_url(client):
+    """Emergency fallback (all unhealthy) must still return a 'url' field."""
+    await client.post("/register", json={"label": "emailer", "endpoint": "http://test:9001"})
+    _health_cache["http://test:9001"] = {
+        "status": "unhealthy", "load": 100.0, "response_time_ms": 0.0, "last_check": "now"
+    }
+    resp = await client.post("/resolve", json={"label": "emailer"})
+    assert resp.status_code == 200
+    data = resp.json()
+    assert "url" in data
+    assert data["selected_by"] == "emergency_fallback"
 
 
 @pytest.mark.asyncio
