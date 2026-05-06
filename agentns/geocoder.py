@@ -13,7 +13,7 @@ Resolution order
 Nominatim fair-use policy
 --------------------------
   - Max 1 request per second (enforced by _rate_limiter)
-  - User-Agent header required (set to "agentns/1.0.0")
+  - User-Agent header required (set to "agentns/2.0.0")
   - Results cached indefinitely in _geocode_cache — a city name never
     changes its coordinates, so cache never needs to expire.
 

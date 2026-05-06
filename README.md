@@ -24,7 +24,13 @@ agentns is a single-binary nameservice sidecar that:
 
 ```bash
 pip install agentns
-agentns-server --port 8200   # start the server
+
+# Dev (no auth key needed):
+AGENTNS_AUTH=off agentns-server --port 8200
+
+# Production (generate a key first):
+# python -c "import secrets; print(secrets.token_urlsafe(32))"
+AGENTNS_API_KEYS="your-key-here" agentns-server --port 8200
 ```
 
 **Target agent** — register yourself so others can find you:
@@ -209,7 +215,7 @@ class ConsulAdapter(RegistryAdapter):
         return {"status": "ok"}
 ```
 
-See [`examples/custom_registry_adapter.py`](examples/custom_registry_adapter.py) for Consul, Kubernetes, and multi-registry examples.
+See the [registry adapter docs](agentns/registry_adapter.py) for Consul, Kubernetes, and multi-registry examples.
 
 ---
 
