@@ -56,11 +56,9 @@ ENV AGENTNS_NAMESPACE=agents.local
 ENV AGENTNS_TLD=agentns.local
 ENV AGENTNS_HEALTH_INTERVAL=30
 ENV AGENTNS_GEOCODING=on
-# Auth: off by default so bare `docker run agentns:latest` works immediately.
-# For production override at runtime:
-#   docker run -e AGENTNS_AUTH=on -e AGENTNS_API_KEYS="your-key" agentns:latest
-ENV AGENTNS_AUTH=off
-# MONGODB_URI — set at runtime if persistence is needed
+# MONGODB_URI      — set at runtime for persistence (in-memory if absent)
+# AGENTNS_PROXY_HOST — set to enable A2A proxy routing (e.g. Agentgateway host)
+# AGENTNS_PROXY_PORT — proxy port (default: 8400)
 
 EXPOSE 8200
 

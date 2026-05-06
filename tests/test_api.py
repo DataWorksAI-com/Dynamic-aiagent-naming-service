@@ -228,3 +228,35 @@ async def test_namespaces(client):
     data = resp.json()
     assert "acme.sales" in data["namespaces"]
     assert "emailer" in data["namespaces"]["acme.sales"]
+
+
+@pytest.mark.asyncio
+async def test_proxy_unknown_label_returns_404(client):
+    """Proxy to an unregistered label must return 404."""
+    resp = await client.post("/proxy/nonexistent", json={"message": "hi"})
+    assert resp.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_proxy_url_format(client):
+    """Proxy URL /proxy/{label} and /proxy/{label}/{path} both route correctly."""
+    await client.post("/register", json={"label": "emailer", "endpoint": "http://host:9001"})
+
+    # We can't actually forward to a real agent in unit tests,
+    # but we can verify the label exists and the proxy finds an endpoint.
+    # A 502 (upstream refused) means the proxy resolved the label successfully.
+    resp = await client.post("/proxy/emailer", json={"method": "message/send", "params": {}})
+    assert resp.status_code in (200, 502, 504)  # resolved label, upstream unreachable in test
+
+    resp2 = await client.get("/proxy/emailer/.well-known/agent.json")
+    assert resp2.status_code in (200, 502)  # resolved label
+
+
+@pytest.mark.asyncio
+async def test_health_exposes_proxy_config(client):
+    """GET /health must always include a 'proxy' key."""
+    resp = await client.get("/health")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert "proxy" in data
+    assert "enabled" in data["proxy"]

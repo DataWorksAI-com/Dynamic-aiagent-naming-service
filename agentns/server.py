@@ -9,12 +9,14 @@ Combines all three resolution hops into one process:
 
 Any agent framework in any language calls the HTTP API:
 
-    POST /resolve     { "agent_name": "urn:myco.com:sales:emailer" }
-    POST /register    { "label": "emailer", "endpoint": "http://..." }
-    GET  /health
-    GET  /agents
-    POST /cache/clear
-    GET  /cache/stats
+    POST   /resolve              { "agent_name": "urn:myco.com:sales:emailer" }
+    POST   /register             { "label": "emailer", "endpoint": "http://..." }
+    DELETE /register/{label}     remove an endpoint
+    ANY    /proxy/{label}[/path] forward requests to the best healthy endpoint
+    GET    /health
+    GET    /agents
+    POST   /cache/clear
+    GET    /cache/stats
 
 Configuration (environment variables — zero hardcoded values)
 -------------------------------------------------------------
@@ -29,6 +31,7 @@ Configuration (environment variables — zero hardcoded values)
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import time as _time
@@ -36,10 +39,12 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
+import httpx
 import uvicorn
-from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request  # noqa: F401
+from starlette.responses import Response, StreamingResponse
 
-from .auth             import security_headers_middleware, validate_secrets_on_startup, verify_api_key
+from .auth             import security_headers_middleware
 from .cache            import ResolutionCache
 from .geocoder         import resolve_city, geocode_cache_snapshot
 from .health_checker   import check_agent_health, probe_endpoint
@@ -67,14 +72,7 @@ except ImportError:
 
 
 def _limit(rate: str):
-    """
-    Return a slowapi rate-limit decorator if slowapi is installed, otherwise a no-op.
-
-    Usage:
-        @app.post("/resolve", dependencies=[Depends(verify_api_key)])
-        @_limit("60/minute")
-        async def resolve(request: Request, body: dict): ...
-    """
+    """Return a slowapi rate-limit decorator if slowapi is installed, otherwise a no-op."""
     if _limiter is not None:
         return _limiter.limit(rate)
     return lambda f: f
@@ -251,7 +249,6 @@ async def _check_single(endpoint_url: str, hc_url: str) -> None:
 
 @asynccontextmanager
 async def lifespan(application: FastAPI):
-    validate_secrets_on_startup()   # crash early if secrets misconfigured
     await _init_mongo()
     await _load_from_mongo()
     await _check_all()          # initial sweep so first /resolve has real data
@@ -338,7 +335,7 @@ def _build_proxy_response(result: Dict, label: str, namespace: str) -> Dict:
 
 # ── POST /resolve ──────────────────────────────────────────────────────────────
 
-@app.post("/resolve", dependencies=[Depends(verify_api_key)])
+@app.post("/resolve")
 @_limit("60/minute")
 async def resolve(request: Request, body: dict):
     """
@@ -538,7 +535,7 @@ async def resolve(request: Request, body: dict):
 
 # ── POST /register ─────────────────────────────────────────────────────────────
 
-@app.post("/register", status_code=200, dependencies=[Depends(verify_api_key)])
+@app.post("/register", status_code=200)
 @_limit("60/minute")
 async def register(request: Request, body: dict):
     """
@@ -631,7 +628,7 @@ async def register(request: Request, body: dict):
 
 # ── DELETE /register/{label} ───────────────────────────────────────────────────
 
-@app.delete("/register/{label}", dependencies=[Depends(verify_api_key)])
+@app.delete("/register/{label}")
 async def deregister(
     request: Request,
     label: str,
@@ -770,11 +767,179 @@ async def cache_stats():
     return await _cache.stats()
 
 
-@app.post("/cache/clear", dependencies=[Depends(verify_api_key)])
+@app.post("/cache/clear")
 @_limit("5/minute")
 async def cache_clear(request: Request):
     count = await _cache.clear()
     return {"status": "cleared", "entries_removed": count}
+
+
+# ── proxy helpers ─────────────────────────────────────────────────────────────
+
+# Headers that must not be forwarded (hop-by-hop per RFC 2616 §13.5.1)
+_HOP_BY_HOP = frozenset([
+    "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
+    "te", "trailers", "transfer-encoding", "upgrade",
+    "host", "content-length",
+])
+
+
+def _proxy_target(label: str) -> str:
+    """Return the best healthy endpoint URL for *label*, or raise 404/503."""
+    endpoints = _registry.get(label)
+    if not endpoints:
+        raise HTTPException(status_code=404, detail=f"No endpoints registered for label '{label}'")
+
+    servers = [
+        {
+            "server_id":        ep["endpoint"],
+            "endpoint":         ep["endpoint"],
+            "health_check_url": ep.get("health_check_url", ""),
+            "protocols":        ep.get("protocols", []),
+            "region":           ep.get("region", ""),
+            "region_label":     ep.get("region_label", ep.get("region", "")),
+            "location":         ep.get("location", {}),
+        }
+        for ep in endpoints
+    ]
+    health_map = {s["server_id"]: _cached_health(s["server_id"]) for s in servers}
+    ranked     = rank_servers(servers, health_map, {})
+    return ranked[0][0]["endpoint"] if ranked else servers[0]["endpoint"]
+
+
+# ── ANY /proxy/{label}[/{path}] ────────────────────────────────────────────────
+
+@app.api_route(
+    "/proxy/{label}",
+    methods=["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"],
+)
+@app.api_route(
+    "/proxy/{label}/{path:path}",
+    methods=["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"],
+)
+async def proxy_agent(request: Request, label: str, path: str = ""):
+    """
+    Forward a request to the best healthy endpoint registered under *label*.
+
+    URL patterns
+    ------------
+        /proxy/{label}                      → {endpoint}/
+        /proxy/{label}/chat                 → {endpoint}/chat
+        /proxy/{label}/.well-known/agent.json → fetched and A2A url field rewritten
+
+    A2A support
+    -----------
+    - For /.well-known/agent.json the response `url` field is rewritten to
+      point back at this proxy so callers never bypass it on future requests.
+    - The A2A method (message/send, message/stream, etc.) is extracted from
+      the request body and added to structured log lines as a2a=<method>.
+
+    Streaming
+    ---------
+    Server-Sent Events (text/event-stream) are forwarded transparently using
+    StreamingResponse so message/stream works end-to-end.
+    """
+    t0 = _time.monotonic()
+
+    # ── 1. pick best healthy endpoint ─────────────────────────────────────────
+    target_ep  = _proxy_target(label)
+    target_url = target_ep.rstrip("/") + ("/" + path if path else "")
+    if request.query_params:
+        target_url += "?" + str(request.query_params)
+
+    # ── 2. A2A agent card — rewrite url to point at this proxy ───────────────
+    if path == ".well-known/agent.json":
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as c:
+                card_resp = await c.get(target_url)
+            data = card_resp.json()
+            proxy_root  = str(request.base_url).rstrip("/")
+            data["url"] = f"{proxy_root}/proxy/{label}"
+            logger.info(f"proxy: agent_card label={label!r} url rewritten → {data['url']!r}")
+            return data
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=f"Could not fetch agent card: {exc}")
+
+    # ── 3. read body; extract A2A method for logging ──────────────────────────
+    body       = await request.body()
+    a2a_method = ""
+    if body:
+        try:
+            a2a_method = json.loads(body).get("method", "")
+        except Exception:
+            pass
+
+    # ── 4. strip hop-by-hop headers ───────────────────────────────────────────
+    fwd_headers = {
+        k: v for k, v in request.headers.items()
+        if k.lower() not in _HOP_BY_HOP
+    }
+
+    # ── 5. forward and stream the response back ────────────────────────────────
+    try:
+        client = httpx.AsyncClient(
+            timeout=httpx.Timeout(connect=5.0, read=60.0, write=10.0, pool=5.0)
+        )
+        upstream_req = client.build_request(
+            method  = request.method,
+            url     = target_url,
+            headers = fwd_headers,
+            content = body,
+        )
+        upstream = await client.send(upstream_req, stream=True)
+
+        status       = upstream.status_code
+        content_type = upstream.headers.get("content-type", "application/octet-stream")
+        resp_headers = {
+            k: v for k, v in upstream.headers.items()
+            if k.lower() not in _HOP_BY_HOP
+        }
+
+        elapsed = round((_time.monotonic() - t0) * 1000, 1)
+        logger.info(
+            f"proxy: {request.method} /proxy/{label}/{path} → {target_ep} "
+            f"[{status}] {elapsed}ms"
+            + (f" a2a={a2a_method!r}" if a2a_method else "")
+        )
+
+        # SSE / chunked — stream bytes directly to caller
+        if "text/event-stream" in content_type:
+            async def _stream_sse():
+                try:
+                    async for chunk in upstream.aiter_bytes():
+                        yield chunk
+                finally:
+                    await upstream.aclose()
+                    await client.aclose()
+            return StreamingResponse(
+                _stream_sse(),
+                status_code = status,
+                headers     = resp_headers,
+                media_type  = content_type,
+            )
+
+        # Normal response — buffer then return
+        try:
+            content = await upstream.aread()
+        finally:
+            await upstream.aclose()
+            await client.aclose()
+
+        return Response(
+            content    = content,
+            status_code = status,
+            headers    = resp_headers,
+            media_type = content_type,
+        )
+
+    except httpx.ConnectError:
+        raise HTTPException(status_code=502, detail=f"Could not connect to '{label}' at {target_ep}")
+    except httpx.TimeoutException:
+        raise HTTPException(status_code=504, detail=f"Agent '{label}' at {target_ep} timed out")
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Proxy error: {exc}")
 
 
 # ── entry point ────────────────────────────────────────────────────────────────
@@ -803,7 +968,7 @@ def main() -> None:
   TLD       : {DEFAULT_TLD}
   MongoDB   : {'connected' if MONGODB_URI else 'disabled (in-memory)'}
   Health    : every {HEALTH_INTERVAL}s
-  A2A Proxy : {_proxy_display}{f'  (mode: {_PROXY_MODE})' if _PROXY_ENDPOINTS else ''}
+  Proxy     : {_proxy_display}
 """)
     uvicorn.run(
         "agentns.server:app",
