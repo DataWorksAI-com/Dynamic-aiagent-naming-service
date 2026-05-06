@@ -125,7 +125,7 @@ class AgentName:
     @property
     def namespace(self) -> str:
         """Application namespace, e.g. "my-app"."""
-        return self.parse().app_namespace
+        return self.parse().namespace
 
     @property
     def tld(self) -> str:

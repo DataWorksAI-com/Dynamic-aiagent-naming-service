@@ -589,8 +589,8 @@ async def register(request: Request, body: dict):
 
 # ── DELETE /register/{label} ───────────────────────────────────────────────────
 
-@app.delete("/register/{label}")
-async def deregister(label: str, body: Optional[Dict] = None):
+@app.delete("/register/{label}", dependencies=[Depends(verify_api_key)])
+async def deregister(request: Request, label: str, body: Optional[Dict] = None):
     """
     Deregister one or all endpoints for *label*.
 
@@ -653,7 +653,7 @@ async def health():
         "ok":                     overall == "ok",
         "status":                 overall,
         "service":                "agentns",
-        "version":                "1.0.0",
+        "version":                "2.0.0",
         "namespace":              DEFAULT_NS,
         "tld":                    DEFAULT_TLD,
         "mongodb_connected":      _mongo_col is not None,
@@ -737,7 +737,7 @@ def main() -> None:
 
     print(f"""
 ╔══════════════════════════════════════════════╗
-║          agentns  v1.0.0  starting           ║
+║          agentns  v2.0.0  starting           ║
 ╚══════════════════════════════════════════════╝
   Port      : {args.port}
   Namespace : {args.namespace}
