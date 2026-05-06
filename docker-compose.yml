@@ -1,14 +1,19 @@
 version: "3.9"
 
-# agentns — complete stack
+# agentns — complete local stack
 #
-# Start everything:   docker compose up
-# Without MongoDB:    docker compose up agentns
-# Production:         docker compose -f docker-compose.yml -f docker-compose.prod.yml up
+# In-memory only (no MongoDB):
+#   docker compose up
+#
+# With local MongoDB (persistent registry):
+#   docker compose --profile mongo up
+#
+# With MongoDB Atlas (cloud):
+#   MONGODB_URI="mongodb+srv://user:pass@cluster.mongodb.net/" docker compose up
 
 services:
 
-  # ── agentns sidecar ─────────────────────────────────────────────────────────
+  # ── agentns ──────────────────────────────────────────────────────────────────
   agentns:
     build: .
     image: agentns:latest
@@ -20,13 +25,15 @@ services:
       AGENTNS_NAMESPACE:       "${AGENTNS_NAMESPACE:-agents.local}"
       AGENTNS_TLD:             "${AGENTNS_TLD:-agentns.local}"
       AGENTNS_HEALTH_INTERVAL: "${AGENTNS_HEALTH_INTERVAL:-30}"
-      MONGODB_URI:             "${MONGODB_URI:-}"        # empty = in-memory mode
-      MONGODB_DB:              "${MONGODB_DB:-agentns}"
-      # Auth — set AGENTNS_AUTH=off for local dev (no API key required).
-      # For production set AGENTNS_AUTH=on and provide AGENTNS_API_KEYS.
-      # Generate a key: python -c "import secrets; print(secrets.token_urlsafe(32))"
-      AGENTNS_AUTH:            "${AGENTNS_AUTH:-off}"
-      AGENTNS_API_KEYS:        "${AGENTNS_API_KEYS:-}"
+      AGENTNS_GEOCODING:       "${AGENTNS_GEOCODING:-on}"
+      # MongoDB — set MONGODB_URI to connect.
+      # When using --profile mongo, the local container is used automatically.
+      # Leave empty to run in in-memory mode (registry lost on restart).
+      MONGODB_URI:  "${MONGODB_URI:-mongodb://agentns-mongo:27017/}"
+      MONGODB_DB:   "${MONGODB_DB:-agentns}"
+      # Proxy — optional Agentgateway integration
+      AGENTNS_PROXY_HOST: "${AGENTNS_PROXY_HOST:-}"
+      AGENTNS_PROXY_PORT: "${AGENTNS_PROXY_PORT:-8400}"
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "python", "-c",
@@ -37,20 +44,19 @@ services:
     networks:
       - agentns-net
 
-  # ── optional: local MongoDB ──────────────────────────────────────────────────
-  # Remove this service if you use MongoDB Atlas or an existing MongoDB instance.
+  # ── local MongoDB (optional — start with --profile mongo) ────────────────────
   mongo:
     image: mongo:7
     container_name: agentns-mongo
     ports:
-      - "27017:27017"
+      - "${MONGO_PORT:-27017}:27017"
     volumes:
       - mongo-data:/data/db
     environment:
       MONGO_INITDB_DATABASE: agentns
     restart: unless-stopped
     profiles:
-      - mongo          # only starts with:  docker compose --profile mongo up
+      - mongo
     networks:
       - agentns-net
 

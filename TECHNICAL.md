@@ -1,7 +1,6 @@
 # agentns — Technical Reference
 
-**Version:** 2.0.0  
-**Organization:** DataWorksAI  
+**Version:** 3.0.0  
 **License:** MIT
 
 ---
@@ -13,53 +12,69 @@
 3. [Startup Sequence](#3-startup-sequence)
 4. [End-to-End Flows](#4-end-to-end-flows)
    - 4.1 [Agent Registration Flow](#41-agent-registration-flow)
-   - 4.2 [Resolution Flow (Cache Hit)](#42-resolution-flow-cache-hit)
-   - 4.3 [Resolution Flow (Cache Miss)](#43-resolution-flow-cache-miss)
-   - 4.4 [Background Health Sweep](#44-background-health-sweep)
-   - 4.5 [Deregistration Flow](#45-deregistration-flow)
+   - 4.2 [Proxy Call Flow](#42-proxy-call-flow)
+   - 4.3 [Resolution Flow (Cache Hit)](#43-resolution-flow-cache-hit)
+   - 4.4 [Resolution Flow (Cache Miss)](#44-resolution-flow-cache-miss)
+   - 4.5 [Background Health Sweep](#45-background-health-sweep)
+   - 4.6 [Deregistration Flow](#46-deregistration-flow)
 5. [Module Reference](#5-module-reference)
-   - 5.1 [server.py](#51-serverpy--main-application)
-   - 5.2 [health_checker.py](#52-health_checkerpy--health-probing)
-   - 5.3 [server_selection.py](#53-server_selectionpy--ranking-engine)
-   - 5.4 [cache.py](#54-cachepy--resolution-cache)
-   - 5.5 [urn_parser.py](#55-urn_parserpy--urn-parsing)
-   - 5.6 [client.py](#56-clientpy--python-client-sdk)
+   - 5.1 [server.py — Main Application](#51-serverpy--main-application)
+   - 5.2 [Built-in Proxy](#52-built-in-proxy)
+   - 5.3 [health_checker.py — Health Probing](#53-health_checkerpy--health-probing)
+   - 5.4 [server_selection.py — Ranking Engine](#54-server_selectionpy--ranking-engine)
+   - 5.5 [geo_policy.py — Geo Routing Policies](#55-geo_policypy--geo-routing-policies)
+   - 5.6 [geocoder.py — City Resolution](#56-geocoderpy--city-resolution)
+   - 5.7 [cache.py — Resolution Cache](#57-cachepy--resolution-cache)
+   - 5.8 [urn_parser.py — URN Parsing](#58-urn_parserpy--urn-parsing)
+   - 5.9 [registry_adapter.py — Pluggable Backends](#59-registry_adapterpy--pluggable-backends)
+   - 5.10 [auth.py — Security Headers](#510-authpy--security-headers)
+   - 5.11 [target_lib.py — Agent Registration SDK](#511-target_libpy--agent-registration-sdk)
+   - 5.12 [requester_lib.py — Agent Resolution SDK](#512-requester_libpy--agent-resolution-sdk)
 6. [Data Models](#6-data-models)
 7. [Server Selection Algorithm](#7-server-selection-algorithm)
-8. [Concurrency Model](#8-concurrency-model)
-9. [Persistence Layer](#9-persistence-layer)
-10. [Configuration Reference](#10-configuration-reference)
-11. [API Reference](#11-api-reference)
+8. [MongoDB Integration](#8-mongodb-integration)
+9. [Concurrency Model](#9-concurrency-model)
+10. [API Reference](#10-api-reference)
+11. [Configuration Reference](#11-configuration-reference)
 12. [Error Handling](#12-error-handling)
 13. [Performance Characteristics](#13-performance-characteristics)
+14. [Deployment Guide](#14-deployment-guide)
+15. [Development Guide](#15-development-guide)
 
 ---
 
 ## 1. System Overview
 
-agentns is a **service discovery sidecar** for multi-agent AI systems. It solves the same problem that DNS solves for the internet — but for AI agents instead of web servers.
+agentns is a **service discovery and proxy sidecar** for multi-agent AI systems. It solves the same problem that DNS solves for the internet — but for AI agents: you call an agent by name, agentns finds the best healthy replica, and either forwards your request directly or tells you where to send it.
 
 ### The Core Problem
 
 In a multi-agent system, orchestrators need to find and call other agents by name. Without a discovery layer, agent URLs are hardcoded. This breaks when:
-- Agents scale horizontally (multiple replicas)
+- Agents scale horizontally (multiple replicas in different regions)
 - Agents move between hosts or clouds
 - An agent goes down and a replica must take over
 - Geographic routing is needed (nearest healthy replica)
+- You want the proxy/routing logic decoupled from each caller
 
 ### What agentns Does
 
-agentns runs as a **sidecar process** alongside your orchestrator. Agents register themselves with the sidecar on startup. Orchestrators ask the sidecar "where is the emailer agent?" and receive back the best available endpoint — selected by health, geographic distance, protocol compatibility, and measured latency.
+agentns runs as a **sidecar process** alongside your orchestrator. Agents register themselves on startup. Callers either:
+
+1. **Call through the proxy** — `POST /proxy/alerts` — agentns resolves + forwards to the best instance
+2. **Resolve first, then call** — `POST /resolve` — get the URL back, call directly
+
+Both approaches use the same health-aware, geo-ranked selection engine.
 
 ### Design Principles
 
 | Principle | Implementation |
 |-----------|---------------|
-| **Zero hardcoded values** | Every IP, URL, and name comes from environment variables |
+| **Zero hardcoded values** | Every URL and name comes from environment variables |
 | **Language-agnostic** | Plain HTTP API — Python, Go, Node.js, Java, curl all work |
 | **Graceful degradation** | Never crashes the caller — returns emergency fallback if all replicas unhealthy |
-| **No single point of failure** | In-memory mode works without MongoDB; MongoDB mode survives restarts |
+| **No auth overhead** | No API keys required — designed for sidecar/internal network deployments |
 | **Self-healing** | Background health loop continuously re-evaluates endpoints, auto-recovers when agents come back |
+| **Optional persistence** | In-memory mode works with zero setup; MongoDB mode survives restarts |
 
 ---
 
@@ -68,79 +83,90 @@ agentns runs as a **sidecar process** alongside your orchestrator. Agents regist
 ### Component Map
 
 ```
-┌──────────────────────────────────────────────────────────────┐
-│                      agentns Process                          │
-│                                                              │
-│  ┌──────────────┐    ┌─────────────────────────────────┐    │
-│  │  FastAPI app  │    │         Global State             │    │
-│  │  (server.py) │    │                                  │    │
-│  │              │    │  _registry: Dict[label, [ep,...]]│    │
-│  │  POST /resolve│    │  _health_cache: Dict[url, dict] │    │
-│  │  POST /register│   │  _cache: ResolutionCache        │    │
-│  │  DELETE /...  │    │  _mongo_col: Collection | None  │    │
-│  │  GET /health  │    └─────────────────────────────────┘    │
-│  │  GET /agents  │                                           │
-│  └──────┬───────┘                                           │
-│         │ calls                                              │
-│  ┌──────▼───────────────────────────────────────────────┐   │
-│  │              Core Modules                             │   │
-│  │                                                       │   │
-│  │  urn_parser.py      → parse / build URNs              │   │
-│  │  health_checker.py  → async HTTP health probes        │   │
-│  │  server_selection.py→ rank endpoints by 5-key sort    │   │
-│  │  cache.py           → TTL resolution cache            │   │
-│  └───────────────────────────────────────────────────────┘   │
-│                                                              │
-│  ┌───────────────────────────────────────────────────────┐   │
-│  │           Background asyncio Task                     │   │
-│  │   _health_loop() — runs every HEALTH_INTERVAL seconds │   │
-│  │   → _check_all() → parallel health probes            │   │
-│  │   → _cache.purge_expired()                           │   │
-│  └───────────────────────────────────────────────────────┘   │
-│                                                              │
-│  ┌───────────────────────────────────────────────────────┐   │
-│  │           MongoDB (optional)                          │   │
-│  │   Collection: agentns.agents                         │   │
-│  │   Indexes: label, (label + endpoint) unique          │   │
-│  └───────────────────────────────────────────────────────┘   │
-└──────────────────────────────────────────────────────────────┘
-         ▲                          ▲
-         │ POST /register           │ POST /resolve
-         │                          │
-   ┌─────┴──────┐            ┌──────┴──────┐
-   │   Agent    │            │ Orchestrator │
-   │ (any lang) │            │  (any lang)  │
-   └────────────┘            └─────────────┘
+┌──────────────────────────────────────────────────────────────────────────┐
+│                              agentns Process                              │
+│                                                                          │
+│  ┌──────────────────┐    ┌───────────────────────────────────────────┐  │
+│  │   FastAPI app     │    │              Global State                  │  │
+│  │   (server.py)    │    │                                            │  │
+│  │                  │    │  _registry:     Dict[label, [ep,...]]      │  │
+│  │  ANY /proxy/{l}  │    │  _health_cache: Dict[url, health_dict]    │  │
+│  │  POST /register  │    │  _cache:        ResolutionCache            │  │
+│  │  DELETE /register│    │  _mongo_col:    Collection | None          │  │
+│  │  POST /resolve   │    │  _PROXY_ENDPOINTS: List[str]              │  │
+│  │  GET /health     │    └───────────────────────────────────────────┘  │
+│  │  GET /agents     │                                                    │
+│  │  GET /namespaces │                                                    │
+│  └──────┬───────────┘                                                    │
+│         │ calls                                                          │
+│  ┌──────▼────────────────────────────────────────────────────────────┐  │
+│  │                         Core Modules                               │  │
+│  │                                                                    │  │
+│  │  urn_parser.py       → parse / build / validate URNs              │  │
+│  │  health_checker.py   → async HTTP health probes                   │  │
+│  │  server_selection.py → rank endpoints by 5-key sort               │  │
+│  │  geo_policy.py       → pluggable geo strategies                   │  │
+│  │  geocoder.py         → city name → lat/lon (Nominatim fallback)   │  │
+│  │  cache.py            → TTL resolution cache                       │  │
+│  │  registry_adapter.py → pluggable registry backends                │  │
+│  │  auth.py             → security headers middleware                 │  │
+│  └───────────────────────────────────────────────────────────────────┘  │
+│                                                                          │
+│  ┌───────────────────────────────────────────────────────────────────┐  │
+│  │                  Background asyncio Task                           │  │
+│  │   _health_loop() — runs every AGENTNS_HEALTH_INTERVAL seconds     │  │
+│  │   → _check_all() → parallel health probes (asyncio.gather)       │  │
+│  │   → _cache.purge_expired()                                        │  │
+│  └───────────────────────────────────────────────────────────────────┘  │
+│                                                                          │
+│  ┌───────────────────────────────────────────────────────────────────┐  │
+│  │                  MongoDB (optional)                                │  │
+│  │   Collection: agentns.agents                                      │  │
+│  │   Indexes: label (single), (label + endpoint) unique compound     │  │
+│  └───────────────────────────────────────────────────────────────────┘  │
+└──────────────────────────────────────────────────────────────────────────┘
+         ▲                    ▲                         ▲
+         │ POST /register     │ ANY /proxy/{label}      │ POST /resolve
+         │                    │                         │
+   ┌─────┴──────┐    ┌────────┴────────┐      ┌────────┴──────┐
+   │   Agent    │    │   Any Caller    │      │  Orchestrator  │
+   │ (any lang) │    │ (resolve+proxy) │      │ (resolve only) │
+   └────────────┘    └─────────────────┘      └───────────────┘
 ```
 
 ### Module Dependency Graph
 
 ```
 server.py
-   ├── urn_parser.py       (parse_urn, build_urn, extract_label)
-   ├── health_checker.py   (check_agent_health, probe_endpoint)
-   ├── server_selection.py (rank_servers, select_protocol, calculate_ttl)
-   └── cache.py            (ResolutionCache)
+   ├── urn_parser.py         (parse_urn, build_urn, extract_label)
+   ├── health_checker.py     (check_agent_health, probe_endpoint)
+   ├── server_selection.py   (rank_servers, select_protocol, calculate_ttl)
+   │     └── geo_policy.py   (NearestPolicy, LeastLoadedPolicy, CompositePolicy)
+   │     └── geocoder.py     (city_to_latlon, Nominatim fallback)
+   ├── cache.py              (ResolutionCache)
+   ├── registry_adapter.py   (HttpRegistryAdapter, StaticRegistryAdapter, ...)
+   └── auth.py               (security_headers_middleware)
 
-client.py                  (standalone — calls server.py via HTTP only)
+target_lib.py                (standalone SDK — calls server.py via HTTP)
+requester_lib.py             (standalone SDK — calls server.py via HTTP)
 ```
 
-### What "Single Binary" Means
+### Single-Binary Design
 
-Traditional ANS architectures use three separate networked hops:
+Traditional ANS architectures use separate networked hops:
 
 ```
-Traditional:  Orchestrator → Recursive Resolver → Registry NS → Auth NS
-agentns:      Orchestrator → agentns (all three hops in one process)
+Traditional:  Caller → Recursive Resolver → Registry NS → Auth NS
+agentns:      Caller → agentns (all hops in one process)
 ```
 
-agentns collapses all three into one in-process function call chain, eliminating the network overhead of the middle hops while keeping the same logical resolution model.
+agentns collapses all three into one in-process call chain, eliminating network overhead while keeping the same logical resolution model.
 
 ---
 
 ## 3. Startup Sequence
 
-When agentns starts (`agentns-server` or `docker run`), the following steps execute in strict order before any HTTP request is accepted:
+When agentns starts (`agentns-server` or `docker run`), the following executes before any HTTP request is accepted:
 
 ```
 Process starts
@@ -155,47 +181,43 @@ main() in server.py
          │
          ├─ Step 1: _init_mongo()
          │     If MONGODB_URI is set:
-         │       - Create AsyncIOMotorClient with 6s selection timeout
-         │       - Get database[MONGODB_DB]
-         │       - Get collection "agents"
+         │       - Create AsyncIOMotorClient (6s selection timeout)
+         │       - Get database[MONGODB_DB] → collection "agents"
          │       - Create index on "label"
          │       - Create unique compound index on (label, endpoint)
-         │       - Ping MongoDB to verify connection
+         │       - Ping to verify connectivity
          │       - Set _mongo_col = collection handle
-         │     If MONGODB_URI is empty:
+         │     If MONGODB_URI is empty or connection fails:
          │       - Log warning, leave _mongo_col = None
-         │       - Continue in in-memory mode
+         │       - Continue in in-memory mode (never blocks startup)
          │
          ├─ Step 2: _load_from_mongo()
          │     If _mongo_col is not None:
          │       - Stream all documents from the collection
-         │       - For each doc: extract label + endpoint fields
-         │       - Append to _registry if endpoint not already present
-         │       - (Prevents duplicates if same endpoint registered twice)
+         │       - Restore _registry[label] list for every persisted endpoint
+         │       - Skip duplicates (idempotent)
+         │       - Agents registered in previous process runs reappear instantly
          │
          ├─ Step 3: _check_all()  ← initial health sweep
-         │     - Build set of unique (endpoint_url, health_check_url) pairs
-         │       from all entries in _registry
+         │     - Deduplicate {endpoint_url → health_check_url} from _registry
          │     - asyncio.gather() all health probes in parallel
-         │     - Write results into _health_cache
-         │     - This ensures the FIRST /resolve call has real health data
-         │       and does not return "unknown" for every endpoint
+         │     - Write results to _health_cache
+         │     - First /resolve call has real health data immediately
          │
          ├─ Step 4: asyncio.create_task(_health_loop())
-         │     - Spawns the background health sweep coroutine
-         │     - Does not block startup — runs concurrently
+         │     - Non-blocking background task started
+         │     - Runs every AGENTNS_HEALTH_INTERVAL seconds
          │
-         ├─ Log: "agentns ready — N endpoint(s) across M label(s) | port P"
+         ├─ Print startup banner:
+         │     "agentns ready — N endpoint(s) | port P | proxy: <url or disabled>"
          │
-         └─ yield  ← server begins accepting HTTP requests
-```
+         └─ yield  ← server accepts HTTP requests
 
-**Shutdown** (Ctrl+C or SIGTERM):
-```
-lifespan resumes after yield
-  └─ task.cancel()           ← signals _health_loop to stop
-  └─ await task              ← waits for clean cancellation
-  └─ except CancelledError   ← expected, suppressed
+Shutdown (SIGTERM / Ctrl+C):
+     lifespan resumes after yield
+       └─ task.cancel()        ← signal background loop to stop
+       └─ await task           ← wait for clean exit
+       └─ except CancelledError ← expected, suppressed
 ```
 
 ---
@@ -204,7 +226,7 @@ lifespan resumes after yield
 
 ### 4.1 Agent Registration Flow
 
-An agent calls `POST /register` on startup. Here is what happens step by step:
+An agent calls `POST /register` on startup. Step-by-step:
 
 ```
 Agent process                agentns server
@@ -215,19 +237,17 @@ POST /register
   "endpoint": "http://ny-host:9001",
   "region": "us-east",
   "location": {"city": "New York"},
-  "protocols": ["http", "A2A"],
+  "protocols": ["A2A"],
   "health_check_url": "http://ny-host:9001/health"
 }
                          ─────────────────────────►
 
                               1. Validate input
-                                 - label and endpoint required
-                                 - HTTP 400 if missing
+                                 label + endpoint required → HTTP 400 if missing
 
                               2. Normalize location
-                                 - city "New York" looked up in CITY_COORDS
-                                 - lat/lon (40.7128, -74.0060) injected
-                                 - Enables geo-routing without caller knowing coords
+                                 city "New York" → CITY_COORDS → lat/lon injected
+                                 Enables geo-routing without caller knowing coords
 
                               3. Build URN
                                  build_urn(DEFAULT_TLD, namespace, label)
@@ -239,21 +259,18 @@ POST /register
                                   location, agent_name}
 
                               5. Check _registry[label]
-                                 If endpoint already exists → update in place
-                                 If endpoint is new → append to list
+                                 Same endpoint → update in place
+                                 New endpoint   → append to list
                                  (multiple endpoints = replica pool)
 
                               6. _save_to_mongo(label, entry)
-                                 MongoDB upsert:
-                                   filter: {label, endpoint}
-                                   $set: all fields + last_seen = now
-                                   $setOnInsert: registered_at = now
-                                 (no-op if MongoDB not configured)
+                                 Upsert:  filter={label, endpoint}
+                                          $set={all fields, last_seen=now}
+                                          $setOnInsert={registered_at=now}
+                                 No-op if MongoDB not configured
 
                               7. asyncio.create_task(_check_single(...))
-                                 Fires a non-blocking background health check
-                                 Result written to _health_cache immediately
-                                 Next /resolve call will have fresh data
+                                 Background health probe — does not delay response
 
                          ◄─────────────────────────
                               {
@@ -261,55 +278,116 @@ POST /register
                                 "label": "emailer",
                                 "endpoint": "http://ny-host:9001",
                                 "agent_name": "urn:agentns.local:agents.local:emailer",
-                                "total_endpoints": 1
+                                "total_endpoints": 1,
+                                "geo_routing": "active"
                               }
 ```
 
-**Key behavior:** If the same `(label, endpoint)` pair is registered again, the existing entry is **updated** (not duplicated). If a new `endpoint` is registered under the same `label`, it is **appended** to the pool — creating a replica group. This is how multi-region failover is achieved.
+**Key behavior:** Same `(label, endpoint)` → updated (no duplicate). New endpoint under same label → appended (replica pool). This is how multi-region failover works.
 
 ---
 
-### 4.2 Resolution Flow (Cache Hit)
+### 4.2 Proxy Call Flow
 
-The fast path — a repeat resolution within the TTL window:
+The caller sends a request to agentns. agentns resolves the label, forwards the request to the best endpoint, and streams the response back. The caller never needs to know the real endpoint URL.
+
+```
+Caller                       agentns server               Target Agent
+──────                       ─────────────                ────────────
+
+POST /proxy/alerts
+{"method":"message/send",
+ "params":{"text":"hi"}}
+                         ─────────────────────────►
+
+                              1. Extract label from URL path
+                                 label = "alerts"
+
+                              2. _proxy_target("alerts")
+                                 → same logic as /resolve (cache-aware)
+                                 → HTTP 404 if label not registered
+
+                              3. Construct target URL
+                                 target_url = f"{best_endpoint}/{path}"
+                                 e.g. "http://ny-host:9001"
+
+                              4. Special case: /.well-known/agent.json
+                                 Forward to target, parse JSON response
+                                 Rewrite "url" field to point at proxy:
+                                   card["url"] = "http://agentns:8200/proxy/alerts"
+                                 Returns rewritten card — callers always see
+                                 the proxy address, never the real endpoint
+
+                              5. For all other paths:
+                                 Read request body
+                                 Extract A2A "method" field for logging (if JSON)
+                                 Strip hop-by-hop headers:
+                                   (connection, keep-alive, transfer-encoding,
+                                    te, trailer, upgrade, proxy-authorization,
+                                    proxy-authenticate, host)
+
+                              6. httpx.AsyncClient stream request
+                                 Method: same as incoming request
+                                 URL: target_url
+                                 Headers: cleaned incoming headers + correct Host
+                                 Body: forwarded as-is
+                                                          ─────────────────────►
+                                                          GET/POST/PUT/... to real
+                                                          agent endpoint
+                                                          ◄─────────────────────
+
+                              7. SSE detection
+                                 If response Content-Type: text/event-stream
+                                   → StreamingResponse (generator yields chunks)
+                                   → Caller receives SSE in real time
+                                 Else
+                                   → Read full body, return Response
+
+                         ◄─────────────────────────
+                              Response from target agent
+                              (status code, headers, body all preserved)
+```
+
+**Agent card rewriting (step 4):**
+When a caller fetches `GET /proxy/alerts/.well-known/agent.json`, the agent card's `url` field is rewritten from `http://ny-host:9001` to `http://agentns:8200/proxy/alerts`. This means subsequent calls from tools that discover the agent card will automatically route through the proxy — enabling transparent health-aware failover for A2A protocol users.
+
+---
+
+### 4.3 Resolution Flow (Cache Hit)
+
+The fast path — repeat resolution within TTL window:
 
 ```
 Orchestrator                 agentns server
 ────────────                 ─────────────
 POST /resolve
-{
-  "agent_name": "urn:agentns.local:agents.local:emailer",
-  "requester_context": {
-    "location": {"city": "Boston"},
-    "protocols": ["A2A", "http"]
-  }
-}
+{"label": "emailer",
+ "requester_context": {
+   "location": {"city": "Boston"},
+   "protocols": ["A2A"]
+ }}
                          ─────────────────────────►
 
-                              1. Parse identifier
-                                 parse_urn("urn:agentns.local:agents.local:emailer")
-                                 → ParsedURN(tld=..., namespace=..., label="emailer")
+                              1. Parse identifier → label = "emailer"
 
                               2. Build cache key
-                                 MD5("emailer" | ["A2A","http"] | {"city":"Boston"})
+                                 MD5("emailer" | ["A2A"] | {"city":"Boston"})
                                  → "a3f2c1..." (deterministic hex digest)
 
                               3. _cache.get(key)
                                  → entry found AND monotonic() < expiry
                                  → hits counter incremented
-                                 → cached payload returned
 
-                              4. Inject resolution_time_ms
-                                 Set cached=True on payload
+                              4. Inject resolution_time_ms, set cached=True
 
                          ◄─────────────────────────
                               {
                                 "endpoint": "http://ny-host:9001",
+                                "url":      "http://ny-host:9001",
                                 "protocol": "A2A",
                                 "ttl": 60,
                                 "cached": true,
-                                "resolution_time_ms": 0.3,
-                                ...
+                                "resolution_time_ms": 0.3
                               }
 ```
 
@@ -317,7 +395,7 @@ Cache hit round-trip: **< 1 ms** (in-process dict lookup + MD5).
 
 ---
 
-### 4.3 Resolution Flow (Cache Miss)
+### 4.4 Resolution Flow (Cache Miss)
 
 The full resolution path — first call or after TTL expiry:
 
@@ -325,155 +403,89 @@ The full resolution path — first call or after TTL expiry:
 Orchestrator                 agentns server
 ────────────                 ─────────────
 POST /resolve
-{
-  "agent_name": "urn:...:emailer",
-  "requester_context": {
-    "location": {"city": "Paris"},
-    "protocols": ["A2A"]
-  }
-}
+{"label": "emailer",
+ "requester_context": {
+   "location": {"city": "Paris"},
+   "protocols": ["A2A"]
+ }}
                          ─────────────────────────►
 
-                              1. Parse URN → label = "emailer"
+                              1. Parse → label = "emailer", cache miss
 
-                              2. Cache miss (key not found or expired)
-
-                              3. Registry lookup
+                              2. Registry lookup
                                  endpoints = _registry["emailer"]
                                  → [nyc_entry, london_entry]
                                  HTTP 404 if label not registered
 
-                              4. Build servers list
-                                 For each endpoint entry, create server dict
-                                 with server_id, protocols, region, location
+                              3. Build servers list + health map
+                                 Read _health_cache for each endpoint
+                                 Live-check any "unknown" endpoints inline
+                                   (parallel asyncio.gather)
 
-                              5. Read health from _health_cache
-                                 health_map = {
-                                   "http://ny-host:9001": {status:"healthy", latency:45ms},
-                                   "http://lon-host:9001": {status:"healthy", latency:210ms}
-                                 }
+                              4. rank_servers(servers, health_map, ctx)
+                                 Paris lat/lon injected from CITY_COORDS
 
-                              6. Live-check unchecked endpoints
-                                 Any server where status == "unknown" (not yet in cache):
-                                 → parallel check_agent_health() calls
-                                 → updates _health_cache and health_map in place
+                                 NYC:    (healthy, A2A✓, 5837km, 45ms, 30%)
+                                 London: (healthy, A2A✓,  341km, 210ms, 20%)
 
-                              7. rank_servers(servers, health_map, requester_context)
-                                 For each server, compute sort key:
-                                   (health_score, protocol_score, geo_km, latency_ms, load)
-                                 
-                                 Requester is in Paris (48.8566°N, 2.3522°E)
-                                 
-                                 NYC:    geo = haversine(Paris, NYC) = 5837 km
-                                 London: geo = haversine(Paris, London) = 341 km
-                                 
-                                 Sort keys:
-                                   NYC:    (0, 0, 5837, 45.0,  30.0)
-                                   London: (0, 0,  341, 210.0, 20.0)
-                                 
-                                 London wins (lower geo distance)
-                                 ranked = [(london_server, london_health), (nyc_server, nyc_health)]
+                                 London wins — geo_km 341 < 5837
+                                 selected_by = "geo_nearest"
 
-                              8. Determine selected_by
-                                 len(ranked) > 1 AND location provided
-                                 → selected_by = "geo_nearest"
+                              5. select_protocol → "A2A"
+                                 calculate_ttl(healthy) → 60s
 
-                              9. select_protocol(["http","A2A"], ["A2A"])
-                                 → "A2A" (first preferred that server supports)
-
-                              10. calculate_ttl({status:"healthy"})
-                                  → 60 seconds
-
-                              11. Build result dict
-                                  + tag with _cache_key_agent = "emailer"
-
-                              12. _cache.set(key, result, ttl=60)
-                                  Store in cache with 60s expiry
-
-                              13. Pop _cache_key_agent from result
-
-                              14. Log:
-                                  "Resolved 'emailer': http://lon-host:9001
-                                   (210ms, ttl=60s, by=geo_nearest)"
+                              6. Build result, _cache.set(key, result, 60)
 
                          ◄─────────────────────────
                               {
                                 "endpoint": "http://lon-host:9001",
+                                "url":      "http://lon-host:9001",
                                 "protocol": "A2A",
                                 "ttl": 60,
                                 "region": "London, UK",
-                                "flag": "🇬🇧",
                                 "cached": false,
                                 "selected_by": "geo_nearest",
                                 "resolution_time_ms": 3.7,
                                 "metadata": {
                                   "label": "emailer",
-                                  "latency_ms": 210.0,
                                   "total_candidates": 2,
-                                  "all_candidates": [
-                                    {"endpoint":"http://lon-host:9001","status":"healthy","latency_ms":210},
-                                    {"endpoint":"http://ny-host:9001","status":"healthy","latency_ms":45}
-                                  ]
+                                  "all_candidates": [...]
                                 }
                               }
 ```
 
 ---
 
-### 4.4 Background Health Sweep
+### 4.5 Background Health Sweep
 
 This loop runs concurrently with all HTTP requests. It is the core of automatic failover and recovery:
 
 ```
 asyncio event loop
-      │
-      ├─ (HTTP requests served here)
-      │
-      └─ _health_loop() [background task]
-              │
-              ├─ loop forever:
+      ├── (HTTP requests served here)
+      └── _health_loop() [background task]
+              ├── loop forever:
               │
               │   _check_all()
-              │     │
-              │     ├─ Build deduped map of {endpoint_url → health_check_url}
-              │     │   from all entries in _registry
-              │     │   (dedup because same endpoint may appear under multiple labels)
-              │     │
-              │     ├─ asyncio.gather(*[_check_one(url, hc_url) for each])
-              │     │     └─ Each _check_one():
-              │     │           check_agent_health(hc_url)  ← HTTP GET
-              │     │           async with _health_lock:
-              │     │             _health_cache[endpoint_url] = result
-              │     │
-              │     │   All probes run in parallel (asyncio, not threads)
-              │     │   gather(return_exceptions=True) so one failure
-              │     │   doesn't cancel the rest
-              │     │
-              │     └─ debug log: "Health sweep: N endpoint(s) checked"
+              │     ├── Build deduped {endpoint_url → health_check_url} from _registry
+              │     ├── asyncio.gather(*[_check_one(url, hc) for each], return_exceptions=True)
+              │     │     └── _check_one():
+              │     │           check_agent_health(hc_url) or probe_endpoint(url)
+              │     │           async with _health_lock: _health_cache[url] = result
+              │     └── All probes run in parallel; one failure doesn't cancel others
               │
               │   _cache.purge_expired()
-              │     └─ Remove entries where monotonic() > expiry
-              │         (prevents unbounded cache growth)
+              │     └── Remove entries where monotonic() > expiry
               │
-              └─ asyncio.sleep(HEALTH_INTERVAL)  ← default 30s
+              └── asyncio.sleep(AGENTNS_HEALTH_INTERVAL)  ← default 30s
 ```
 
-**Failover scenario:**
-1. `emailer-nyc` endpoint goes down between sweeps
-2. At next sweep (~30s): `check_agent_health` returns `{status: "unhealthy"}`
-3. `_health_cache["http://nyc:9001"] = {status: "unhealthy", ...}`
-4. Next `/resolve` call: `rank_servers()` sees nyc=unhealthy, excludes it
-5. London endpoint selected automatically — no configuration change
-
-**Recovery scenario:**
-1. `emailer-nyc` comes back up
-2. At next sweep: `check_agent_health` returns `{status: "healthy", latency: 45ms}`
-3. `_health_cache` updated
-4. Next `/resolve` call: both endpoints healthy, NYC wins on latency (45ms vs 210ms)
+**Failover:** endpoint goes down → next sweep marks it unhealthy → next resolve skips it automatically.  
+**Recovery:** endpoint comes back → next sweep marks it healthy → immediately available for routing.
 
 ---
 
-### 4.5 Deregistration Flow
+### 4.6 Deregistration Flow
 
 ```
 Agent shutting down          agentns server
@@ -482,26 +494,18 @@ DELETE /register/emailer
 {"endpoint": "http://ny-host:9001"}
                          ─────────────────────────►
 
-                              1. Check label in _registry
-                                 HTTP 404 if not found
+                              1. HTTP 404 if label not in _registry
 
                               2. endpoint provided → remove specific entry
-                                 _registry["emailer"] filtered to exclude nyc
-                                 If list becomes empty → delete key entirely
+                                 list becomes empty → delete key entirely
 
-                                 No endpoint → remove all endpoints for label
-                                 _registry.pop("emailer")
+                              No endpoint → remove all for label
 
-                              3. MongoDB cleanup
-                                 delete_one({label, endpoint})  ← specific
-                                 delete_many({label})           ← all
+                              3. MongoDB: delete_one({label, endpoint})
+                                          or delete_many({label})
 
                          ◄─────────────────────────
-                              {
-                                "status": "deregistered",
-                                "label": "emailer",
-                                "removed": 1
-                              }
+                              {"status": "deregistered", "label": "emailer", "removed": 1}
 ```
 
 ---
@@ -511,554 +515,300 @@ DELETE /register/emailer
 ### 5.1 `server.py` — Main Application
 
 **File:** `agentns/server.py`  
-**Purpose:** FastAPI application. Owns all HTTP endpoints, global state, startup/shutdown, MongoDB integration, and the background health loop.
+**Purpose:** FastAPI application. Owns all HTTP endpoints, global state, startup/shutdown, MongoDB integration, background health loop, and the built-in proxy.
 
 #### Global State
 
 ```python
 _registry: Dict[str, List[Dict]]
 ```
-The primary data structure. Maps every registered `label` to a list of endpoint dicts. One label can have many endpoints (replica pool). Updated by `register()` and `deregister()`. Read by `resolve()`.
+Primary data structure. Maps every registered `label` to a list of endpoint entry dicts. One label = one replica pool.
 
 ```python
 _health_cache: Dict[str, Dict]
 ```
-Maps every `http_endpoint` URL to its most recent health result dict. Written exclusively by `_check_all()`, `_check_single()`, and the live-check block inside `resolve()`. Protected by `_health_lock`. Read by `_cached_health()`.
+Maps endpoint URL → most recent health result. Written by `_check_all()`, `_check_single()`, and live-check block inside `resolve()`. Protected by `_health_lock`.
 
 ```python
 _health_lock: asyncio.Lock
 ```
-Prevents concurrent writes to `_health_cache` from the background loop and from on-demand checks inside `resolve()`.
+Prevents concurrent writes to `_health_cache` from the background loop and inline resolve checks.
 
 ```python
 _cache: ResolutionCache
 ```
-Singleton instance of the TTL resolution cache. Holds fully-resolved response payloads keyed by MD5 of (label + protocols + location).
+TTL resolution cache. Holds fully-resolved response payloads keyed by MD5 of (label + protocols + location).
 
 ```python
 _mongo_col: Optional[AsyncIOMotorCollection]
 ```
-Handle to the MongoDB `agents` collection. `None` if MongoDB is not configured or the connection failed. All MongoDB operations are guarded by `if _mongo_col is None: return`.
+Handle to the MongoDB `agents` collection. `None` if not configured or connection failed.
 
----
-
-#### `_init_mongo() → None` (async)
-
-**Called by:** `lifespan()` at startup  
-**Purpose:** Establishes MongoDB connection and creates indexes.
-
-Procedure:
-1. Checks `MONGODB_URI` env var. Returns immediately if empty.
-2. Creates `AsyncIOMotorClient` with a 6-second server selection timeout (prevents hanging startup if MongoDB is unreachable).
-3. Gets the database and `agents` collection.
-4. Creates two indexes:
-   - Single-field index on `label` — fast lookups by agent name
-   - Unique compound index on `(label, endpoint)` — prevents duplicate registrations, enables upsert semantics
-5. Pings the admin endpoint to verify connectivity.
-6. Sets `_mongo_col` globally.
-
-On any exception: logs the error and sets `_mongo_col = None`. The server continues in in-memory mode — MongoDB failure never prevents startup.
-
----
-
-#### `_load_from_mongo() → None` (async)
-
-**Called by:** `lifespan()` at startup, after `_init_mongo()`  
-**Purpose:** Restores the `_registry` from MongoDB so that dynamically registered agents (registered in a previous process run) survive restarts.
-
-Procedure:
-1. If `_mongo_col is None`, returns immediately.
-2. Streams all documents from the collection with `find({})`.
-3. For each document, extracts `label` and removes MongoDB internal fields (`_id`).
-4. Checks whether the endpoint already exists in `_registry[label]` (guarded to prevent duplicates if static agents and MongoDB have overlapping entries).
-5. Appends new entries.
-
-**Why this matters:** Without this function, every restart loses all dynamically registered agents (e.g. geo-replica agents registered by remote processes). With it, the registry is restored to its pre-restart state within the first seconds of startup.
-
----
-
-#### `_save_to_mongo(label, entry) → None` (async)
-
-**Called by:** `register()` after every successful registration  
-**Purpose:** Persists a single endpoint entry to MongoDB.
-
-Procedure:
-1. Copies the `entry` dict (avoids mutating the in-memory copy).
-2. Adds `label` field to the MongoDB document.
-3. Performs an **upsert** using `update_one()`:
-   - Filter: `{label, endpoint}` — the unique identity of this registration
-   - `$set`: all fields + `last_seen = now` (updated on every re-registration)
-   - `$setOnInsert`: `registered_at = now` (only set when a new document is created)
-4. The upsert ensures idempotency — re-registering the same endpoint updates metadata without creating duplicates.
-
----
-
-#### `_check_all() → None` (async)
-
-**Called by:** `lifespan()` (once at startup), `_health_loop()` (every N seconds)  
-**Purpose:** Parallel health probe of every unique registered endpoint.
-
-Procedure:
-1. Iterates `_registry` to build a deduped dict `{endpoint_url: health_check_url}`.
-   - Deduplication is important: if "emailer-nyc" and "invoicer-nyc" share the same host, only one probe is sent.
-2. If the dict is empty (no registered agents), returns early.
-3. Defines inner coroutine `_check_one(endpoint_url, hc_url)`:
-   - If `hc_url` is set: calls `check_agent_health(hc_url)`
-   - If empty: calls `probe_endpoint(endpoint_url)` (auto-discovery)
-   - Acquires `_health_lock` and writes result to `_health_cache`
-4. Runs all `_check_one` coroutines concurrently via `asyncio.gather(..., return_exceptions=True)`.
-   - `return_exceptions=True` is critical: a timeout or connection error in one probe does not cancel the rest.
-
----
-
-#### `_health_loop() → None` (async)
-
-**Called by:** `lifespan()` via `asyncio.create_task()`  
-**Purpose:** Infinite loop that periodically checks all endpoints and purges the resolution cache.
-
-```
-while True:
-    _check_all()          ← probe every endpoint
-    _cache.purge_expired() ← evict stale cache entries
-    asyncio.sleep(HEALTH_INTERVAL)
-```
-
-The loop is wrapped in `try/except` so a single loop iteration error (e.g. a transient network error during gather) logs a warning but does not terminate the loop.
-
-The loop is cancelled cleanly during shutdown via `task.cancel()` + `await task` in `lifespan()`.
-
----
-
-#### `_cached_health(endpoint_url) → Dict`
-
-**Called by:** `resolve()`, `health()`, `list_agents()`  
-**Purpose:** Safe read from `_health_cache` with a default sentinel.
-
-Returns the stored health dict if present, or a default dict with `status="unknown"` if the endpoint has never been probed. This prevents KeyError and ensures `rank_servers()` always receives a valid health dict.
-
-The "unknown" default causes `rank_servers()` to assign `health_score=2` (between degraded and unhealthy), which means never-probed endpoints are ranked lower than healthy endpoints but higher than unhealthy ones.
-
----
-
-#### `_check_single(endpoint_url, hc_url) → None` (async)
-
-**Called by:** `register()` via `asyncio.create_task()`  
-**Purpose:** One-shot health probe for a freshly registered endpoint.
-
-Immediately probes the newly registered endpoint so that the first `/resolve` call after registration has real health data rather than the "unknown" sentinel. This is non-blocking (fired as a background task) so the `/register` response is not delayed.
-
----
-
-#### `lifespan(application) → AsyncContextManager`
-
-**FastAPI lifespan context manager.**  
-Everything before `yield` runs at startup; everything after runs at shutdown.
+#### Proxy Configuration
 
 ```python
-@asynccontextmanager
-async def lifespan(application: FastAPI):
-    await _init_mongo()          # Step 1: connect to MongoDB
-    await _load_from_mongo()     # Step 2: restore registry
-    await _check_all()           # Step 3: initial health sweep
-    task = asyncio.create_task(_health_loop())  # Step 4: start background loop
-    yield                        # ← server is running
-    task.cancel()                # Step 5: cancel loop
-    await task                   # Step 6: wait for clean exit
+_PROXY_HOST      = os.getenv("AGENTNS_PROXY_HOST", "").strip()
+_PROXY_PORT      = os.getenv("AGENTNS_PROXY_PORT", "8400").strip()
+_PROXY_MODE      = os.getenv("AGENTNS_PROXY_MODE", "agentgateway").lower().strip()
+SLIM_ORG         = os.getenv("SLIM_ORG", "")
+_raw_proxy_eps   = os.getenv("A2A_PROXY_ENDPOINTS", "")
 ```
 
----
+Resolution order for `_PROXY_ENDPOINTS`:
+1. `A2A_PROXY_ENDPOINTS` — explicit comma-separated list (lowest level, overrides everything)
+2. `AGENTNS_PROXY_HOST` + `AGENTNS_PROXY_PORT` — high-level host/port pair
+3. Empty list — proxy passthrough disabled
 
-#### `POST /resolve` — `resolve(body)`
+#### Core Functions (summary)
 
-The primary API endpoint. Full logic:
-
-1. **Identifier parsing** — Accepts `agent_name` (URN), `urn`, `agent`, or `label` fields. Priority: URN fields first, plain label second. URN is parsed by `parse_urn()` to extract the `label`.
-2. **Cache key** — `_cache.make_key(label, requester_context)` → MD5 hex string.
-3. **Cache check** — `await _cache.get(key)`. If hit: inject `resolution_time_ms`, set `cached=True`, return immediately.
-4. **Registry lookup** — `_registry.get(label)`. HTTP 404 if label unknown.
-5. **Server list construction** — Flatten endpoint dicts into a normalized `servers` list with consistent keys (`server_id`, `endpoint`, `health_check_url`, `protocols`, `region`, `region_label`, `flag`, `location`).
-6. **Health map population** — `_cached_health()` for each server. Identifies any server with `status="unknown"` (never probed).
-7. **Live check for unchecked** — If any server is "unknown", runs `check_agent_health()` (with explicit URL) or `probe_endpoint()` (auto-discover) inline. Parallel via `asyncio.gather()`. Updates both `_health_cache` and the local `health_map`.
-8. **Ranking** — `rank_servers(servers, health_map, requester_context)`. Returns sorted list, unhealthy excluded.
-9. **Emergency fallback** — If `ranked` is empty (all endpoints unhealthy): returns first server with TTL=5, `selected_by="emergency_fallback"`. Never raises a 503.
-10. **Winner extraction** — `ranked[0]` is `(best_server, best_health)`.
-11. **Protocol selection** — `select_protocol(best_server["protocols"], preferred_protocols)`.
-12. **TTL calculation** — `calculate_ttl(best_health)`.
-13. **`selected_by` determination** — `"only_available"` if one healthy server, `"geo_nearest"` if location provided, `"lowest_latency"` otherwise.
-14. **Cache store** — `_cache.set(key, result, ttl)`.
-15. **Return** — Full result dict.
+| Function | Called By | Purpose |
+|----------|-----------|---------|
+| `_init_mongo()` | lifespan | Connect to MongoDB, create indexes |
+| `_load_from_mongo()` | lifespan | Restore registry from MongoDB |
+| `_save_to_mongo(label, entry)` | register() | Upsert endpoint to MongoDB |
+| `_check_all()` | lifespan + _health_loop | Parallel health probe of all endpoints |
+| `_check_single(url, hc)` | register() | One-shot probe for freshly registered endpoint |
+| `_health_loop()` | lifespan (task) | Infinite background sweep loop |
+| `_cached_health(url)` | resolve(), health() | Safe read from _health_cache with default |
+| `_proxy_target(label)` | proxy_agent() | Resolve label to best endpoint URL |
+| `lifespan()` | FastAPI | Startup + shutdown orchestration |
 
 ---
 
-#### `POST /register` — `register(body)`
+### 5.2 Built-in Proxy
 
-1. Validates `label` and `endpoint` (HTTP 400 if missing).
-2. Applies defaults: `namespace=DEFAULT_NS`, `protocols=["http"]`.
-3. **City normalization**: if `location.city` is provided without coordinates, looks up `CITY_COORDS[city]` and injects `latitude`/`longitude`. Enables geo-routing without the caller knowing exact coordinates.
-4. Builds `entry` dict including the constructed `agent_name` URN.
-5. Checks for existing entry in `_registry[label]`:
-   - If found: updates in place (all fields overwritten)
-   - If new: appends (creating a new replica in the pool)
-6. Calls `_save_to_mongo()` to persist.
-7. Fires `_check_single()` as a background task.
-8. Returns `{status, label, endpoint, agent_name, total_endpoints}`.
+**Routes:**
+```python
+@app.api_route("/proxy/{label}", methods=["GET","POST","PUT","DELETE","PATCH","HEAD","OPTIONS"])
+@app.api_route("/proxy/{label}/{path:path}", methods=["GET","POST","PUT","DELETE","PATCH","HEAD","OPTIONS"])
+async def proxy_agent(request: Request, label: str, path: str = ""):
+```
 
----
+**Purpose:** Forward any HTTP request to the best healthy instance of the named agent. The caller never needs to know the real endpoint URL.
 
-#### `DELETE /register/{label}` — `deregister(label, body)`
+#### `_HOP_BY_HOP` frozenset
 
-1. HTTP 404 if label not in `_registry`.
-2. If `body.endpoint` provided: removes that specific endpoint from the list. If list becomes empty, deletes the label key entirely.
-3. If no `endpoint`: removes all endpoints for the label (`_registry.pop`).
-4. Calls `delete_one` or `delete_many` on MongoDB accordingly.
-5. Returns `{status, label, removed}`.
+Headers that must be stripped before forwarding (RFC 7230):
+```python
+_HOP_BY_HOP = frozenset({
+    "connection", "keep-alive", "transfer-encoding",
+    "te", "trailer", "upgrade",
+    "proxy-authorization", "proxy-authenticate", "host",
+})
+```
 
----
+These headers are specific to the current connection and must not be forwarded to the upstream. Forwarding `host` in particular would break virtual-host routing on the target.
 
-#### `GET /health` — `health()`
+#### `_proxy_target(label) → str` (async)
 
-Reads `_registry` and `_health_cache` (via `_cached_health`) to build a per-agent, per-endpoint status report. Determines overall status: `"ok"` if no endpoint is unhealthy, `"degraded"` otherwise. Returns service metadata (version, MongoDB connection status, uptime, total counts).
+Resolves a label to the best endpoint URL using the same logic as `POST /resolve` (reads `_registry`, applies `rank_servers()`, uses `_cache`). Returns the raw endpoint URL string. Raises `HTTPException(404)` if the label is unknown.
 
----
+Called internally by `proxy_agent()` only.
 
-#### `GET /agents` — `list_agents()`
+#### `proxy_agent()` — full logic
 
-Returns the full registry with current health status for every endpoint. Includes `agent_name` (URN), `namespace`, `protocols`, and `last_check` timestamp. Designed for UI dashboards and debugging.
+1. `_proxy_target(label)` → `base_url`. HTTP 404 if label not registered.
+2. Construct `target_url = f"{base_url}/{path}"` (path may be empty).
+3. **Agent card rewriting** — if `path == ".well-known/agent.json"`:
+   - Forward request to target
+   - Parse JSON response
+   - Overwrite `card["url"]` with `f"{request.base_url}proxy/{label}"` (proxy address)
+   - Return rewritten JSON — A2A callers see proxy URL in agent card, enabling transparent routing
+4. **All other paths:**
+   - Read full request body
+   - Extract A2A `method` field from JSON body for access logging (silently ignored if body is not JSON)
+   - Build forwarding headers: start with incoming headers, remove hop-by-hop, set correct `host`
+   - Open `httpx.AsyncClient()` stream request (same HTTP method, target URL, cleaned headers, body)
+   - If response `Content-Type: text/event-stream` → yield chunks as `StreamingResponse` (real-time SSE)
+   - Else → await full response body, return `Response` with status code and response headers
 
----
-
-#### `GET /namespaces` — `namespaces()`
-
-Groups all labels by their registered namespace. Returns `{tld, namespaces: {namespace: [label, ...]}}`. Useful for namespace-level browsing.
-
----
-
-#### `GET /cache/stats` — `cache_stats()`
-
-Delegates to `_cache.stats()`. Returns hit/miss counts, hit rate, active vs expired entries.
-
----
-
-#### `POST /cache/clear` — `cache_clear()`
-
-Delegates to `_cache.clear()`. Flushes all cached resolutions. Useful after a bulk re-registration event.
-
----
-
-#### `main() → None`
-
-CLI entry point invoked by `agentns-server` command or `python -m agentns`.
-
-1. Parses CLI arguments: `--port`, `--host`, `--log-level`, `--namespace`.
-2. If `--namespace` differs from default, sets the env var so the FastAPI app picks it up.
-3. Prints startup banner with config summary.
-4. Calls `uvicorn.run("agentns.server:app", ...)`.
+**Error handling:**
+- `httpx.ConnectError` → HTTP 502 Bad Gateway
+- `httpx.TimeoutException` → HTTP 504 Gateway Timeout
+- Any other httpx error → HTTP 502
 
 ---
 
-### 5.2 `health_checker.py` — Health Probing
+### 5.3 `health_checker.py` — Health Probing
 
 **File:** `agentns/health_checker.py`  
 **Purpose:** Async HTTP health checking. Probes agent endpoints and returns a normalized health dict.
 
-#### Module-Level Constants
+#### Constants
 
 ```python
 CONNECT_TIMEOUT = 5.0   # seconds to establish TCP connection
 READ_TIMEOUT    = 5.0   # seconds to read response body
-SLOW_MS         = 2000  # milliseconds above which status → "degraded"
+SLOW_MS         = 2000  # ms above which status → "degraded"
 ```
-
----
 
 #### `_get_client() → httpx.AsyncClient`
 
-Returns a shared singleton `httpx.AsyncClient`. Lazily created on first call. Recreated if the client has been closed.
+Lazy singleton httpx client. Configured with:
+- Connection pool: up to 100 connections, 20 keepalive
+- Auto-redirect following
+- Separate connect, read, write, pool timeouts
 
-The client is configured with:
-- **Connection pool**: up to 100 concurrent connections, 20 keepalive
-- **Redirects**: followed automatically
-- **Timeouts**: separate connect, read, write, and pool timeouts
-
-Using a singleton client (rather than creating a new one per check) is important for performance — it allows connection reuse and avoids the overhead of creating a new TLS session for every probe.
-
----
-
-#### `_now_iso() → str`
-
-Returns the current UTC time as an ISO-8601 string. Used to populate `last_check` in every health result.
-
----
+Reusing a singleton avoids TLS handshake overhead on every probe.
 
 #### `_unhealthy(reason="") → Dict`
 
-Factory function that returns a standardized "unhealthy" result dict:
+Returns standardized unhealthy dict:
 ```python
-{
-    "status":           "unhealthy",
-    "load":             100.0,    # max load — worst case for ranking
-    "response_time_ms": 0.0,
-    "last_check":       "<now>",
-    "reason":           "<reason string>"
-}
+{"status": "unhealthy", "load": 100.0, "response_time_ms": 0.0, "last_check": "<now>", "reason": reason}
 ```
-`load=100.0` ensures unhealthy servers sort to the end even on the load tiebreaker.
-
----
+`load=100.0` ensures unhealthy servers sort to the end on the load tiebreaker.
 
 #### `check_agent_health(health_url) → Dict` (async)
 
-The primary health probe function. Given a full URL:
-
-1. Gets the shared httpx client.
-2. Records `t0 = time.perf_counter()`.
-3. Issues `GET health_url`.
-4. Calculates `elapsed = (perf_counter() - t0) * 1000` (milliseconds).
-5. If response status >= 400 → returns `_unhealthy(f"HTTP {status_code}")`.
-6. Attempts to parse JSON body and extract `load_percent` or `load` field.
-   - If JSON parsing fails (e.g. HTML response) → silently defaults to `load=50.0`
-7. Determines status:
+1. GET `health_url`, measure round-trip in ms
+2. HTTP status >= 400 → `_unhealthy(f"HTTP {status_code}")`
+3. Parse JSON body, extract `load_percent` or `load` field (default 50.0 on parse failure)
+4. Status logic:
    - `load >= 90` OR `elapsed > SLOW_MS` → `"degraded"`
    - Otherwise → `"healthy"`
-8. Returns `{status, load, response_time_ms, last_check}`.
 
-Exception handling:
-- `httpx.ConnectError` → `_unhealthy("connection refused")`
-- `httpx.TimeoutException` → `_unhealthy("timeout")`
-- Any other exception → `_unhealthy(str(exc)[:80])` (truncated to prevent huge log messages)
-
----
+Exception mapping: `ConnectError` → unhealthy("connection refused"), `TimeoutException` → unhealthy("timeout"), any other → unhealthy(str(exc)[:80]).
 
 #### `probe_endpoint(endpoint) → Dict` (async)
 
-Auto-discovery function. Tries three standard health URLs in order:
+Auto-discovery for endpoints registered without a `health_check_url`. Tries in order:
 1. `{endpoint}/.well-known/agent.json` — A2A AgentCard standard
 2. `{endpoint}/health` — REST convention
 3. `{endpoint}/healthz` — Kubernetes convention
 
-Returns the first non-unhealthy result. If all three fail, returns `_unhealthy("all probe URLs failed")`.
-
-This function is called when an endpoint was registered without a `health_check_url`, or when a never-seen endpoint needs immediate checking during resolution.
+Returns first successful result. Falls back to `_unhealthy("all probe URLs failed")`.
 
 ---
 
-### 5.3 `server_selection.py` — Ranking Engine
+### 5.4 `server_selection.py` — Ranking Engine
 
 **File:** `agentns/server_selection.py`  
-**Purpose:** Pure functions for ranking a pool of endpoints. No I/O, no state. Deterministic given the same inputs.
+**Purpose:** Pure ranking functions. No I/O, no state. Deterministic given the same inputs.
 
 #### `CITY_COORDS: Dict[str, Tuple[float, float]]`
 
-A lookup table mapping lowercase city name strings to `(latitude, longitude)` tuples. Covers 60+ cities across North America, Europe, Asia-Pacific, and South America.
-
-Used by:
-- `_resolve_location()` — to convert a requester's city name to coordinates
-- `register()` in server.py — to inject coordinates when an agent registers with just a city name
-
----
+160+ cities → `(latitude, longitude)`. Used to inject coordinates when an agent registers with just a city name, and to resolve requester location from context.
 
 #### `_haversine(lat1, lon1, lat2, lon2) → float`
 
-Computes the great-circle distance in kilometres between two lat/lon points.
+Great-circle distance in km using the Haversine formula. R = 6371.0 km. Accurate to < 0.5% for any two points on Earth.
 
-Formula:
-```
-a = sin²(Δlat/2) + cos(lat1) · cos(lat2) · sin²(Δlon/2)
-distance = 2 · R · arcsin(√a)
-```
-Where `R = 6371.0 km` (Earth's mean radius).
+#### `rank_servers(servers, health_map, ctx, geo_policy=None) → List[Tuple]`
 
-This is the standard Haversine formula — accurate for distances up to 20,000 km, with error < 0.5%.
+Core ranking function. Returns `[(server_dict, health_dict), ...]` sorted best-first.
 
-Example outputs:
-- Boston → New York: ~306 km
-- Boston → London: ~5,263 km
-- Paris → Frankfurt: ~448 km
-
----
-
-#### `_resolve_location(ctx) → Optional[Tuple[float, float]]`
-
-Extracts a `(latitude, longitude)` pair from the `requester_context` dict.
-
-Accepts three input forms:
+Sort key per server:
 ```python
-{"location": {"latitude": 48.8, "longitude": 2.35}}   # explicit coords
-{"location": {"city": "Paris"}}                        # city lookup
-{"city": "Paris"}                                      # flat form
-```
-
-Also accepts field aliases: `lat`/`lon`/`lng` in addition to `latitude`/`longitude`.
-
-Returns `None` if no location can be extracted (triggers `math.inf` geo distance in ranking, falling through to latency-based selection).
-
----
-
-#### `_health_score(status) → int`
-
-Maps health status string to a numeric sort score:
-
-| Status | Score |
-|--------|-------|
-| `"healthy"` | 0 |
-| `"degraded"` | 1 |
-| `"unknown"` | 2 |
-| `"unhealthy"` | 3 |
-
-Any unrecognized status defaults to 2 (unknown). Lower is better in the sort.
-
----
-
-#### `_geo_distance(server, requester_latlon) → float`
-
-Computes the haversine distance between a server's `location` dict and the requester's `(lat, lon)` tuple.
-
-Returns `math.inf` if:
-- `requester_latlon` is `None` (no location provided)
-- The server's `location` dict has no coordinates
-
-`math.inf` causes geo distance to not be a deciding factor — the sort falls through to `response_time_ms`.
-
----
-
-#### `rank_servers(servers, health_map, requester_context, include_unhealthy=False) → List[Tuple]`
-
-The core ranking function. Returns `[(server_dict, health_dict), ...]` sorted best-first.
-
-**Algorithm for each server:**
-
-```python
-sort_key = (
-    _health_score(status),          # 0=healthy → 3=unhealthy
+(
+    _health_score(status),          # 0=healthy → 3=unhealthy (excluded)
     proto_score,                    # 0=preferred protocol available, 1=not
-    _geo_distance(server, latlon),  # km, inf if no location
+    _geo_distance(server, latlon),  # km, inf if no location data
     health.get("response_time_ms"), # ms, 9999 if unknown
-    health.get("load"),             # 0–100%
+    health.get("load"),             # 0–100%, 50 if not reported
 )
 ```
 
-- If `status == "unhealthy"` and `include_unhealthy=False` (default): skip this server entirely. It won't appear in the result.
-- All remaining servers are appended to `scored` list with their key tuple.
-- `scored.sort(key=lambda x: x[0])` — Python's tuple comparison is lexicographic: the first differing element decides. Only when health scores are equal does protocol matter; only when protocol scores are equal does geo matter; and so on.
-
-Returns `[(server, health)]` pairs stripped of the sort key.
-
----
+Unhealthy endpoints are excluded entirely (not just ranked last) unless `include_unhealthy=True`.
 
 #### `select_protocol(server_protocols, preferred) → str`
 
-Iterates through `preferred` in order, returns the first one that exists in `server_protocols` (case-insensitive comparison via `.upper()`).
-
-Falls back to `server_protocols[0]` if no preferred protocol is available. Falls back to `"http"` if `server_protocols` is empty.
-
----
+Returns first protocol from `preferred` that exists in `server_protocols` (case-insensitive). Falls back to `server_protocols[0]`, then `"http"`.
 
 #### `calculate_ttl(health) → int`
 
-Returns a TTL in seconds based on health status. The logic is conservative:
-
 | Status | TTL | Rationale |
 |--------|-----|-----------|
-| `healthy` | 60s | Stable — no need to recheck frequently |
-| `degraded` | 15s | Unstable — recheck soon in case it recovers |
-| `unknown` | 10s | No data — recheck quickly |
-| `unhealthy` | 5s | Last resort — recheck almost immediately |
-
-A TTL of 60s means the orchestrator can call the same agent label 60 times per minute and get sub-millisecond responses (all from cache). At second 61, the cache expires and a fresh resolution runs.
+| healthy | 60s | Stable |
+| degraded | 15s | Recheck soon |
+| unknown | 10s | No data yet |
+| unhealthy | 5s | Emergency fallback — recheck almost immediately |
 
 ---
 
-### 5.4 `cache.py` — Resolution Cache
+### 5.5 `geo_policy.py` — Geo Routing Policies
+
+**File:** `agentns/geo_policy.py`  
+**Purpose:** Pluggable strategies for the geographic component of server selection.
+
+```python
+from agentns.geo_policy import NearestPolicy, LeastLoadedPolicy, CompositePolicy
+from agentns.server_selection import rank_servers
+
+# Distance only (ignores load and latency for geo component):
+ranked = rank_servers(servers, health_map, ctx, geo_policy=NearestPolicy())
+
+# Load only:
+ranked = rank_servers(servers, health_map, ctx, geo_policy=LeastLoadedPolicy())
+
+# Default composite (distance + RTT + load weighted sum):
+ranked = rank_servers(servers, health_map, ctx)
+```
+
+The `CompositePolicy` weights:
+```
+score = (geo_weight × distance_km) + (rtt_weight × response_ms) + (load_weight × load%)
+```
+
+Default weights: `geo=0.5, rtt=0.3, load=0.2`. Override via subclass.
+
+---
+
+### 5.6 `geocoder.py` — City Resolution
+
+**File:** `agentns/geocoder.py`  
+**Purpose:** Resolve city names to lat/lon coordinates. CITY_COORDS provides 160+ built-in cities. Unknown cities fall back to OpenStreetMap Nominatim (free, no API key required).
+
+Nominatim calls are cached in-process to avoid repeated network lookups. Disable with `AGENTNS_GEOCODING=off`.
+
+---
+
+### 5.7 `cache.py` — Resolution Cache
 
 **File:** `agentns/cache.py`  
-**Purpose:** Thread-safe (asyncio-safe), TTL-based in-memory cache for resolved agent responses.
+**Purpose:** asyncio-safe, TTL-based in-memory cache for resolved agent responses.
 
-#### `ResolutionCache` class
+#### `ResolutionCache`
 
 Internal state:
 ```python
-_store: Dict[str, Tuple[Any, float]]  # key → (payload, expiry_monotonic)
-_lock:  asyncio.Lock                  # serializes all mutations
-_hits:  int                           # hit counter (for stats)
-_misses: int                          # miss counter
+_store:  Dict[str, Tuple[Any, float]]  # key → (payload, expiry_monotonic)
+_lock:   asyncio.Lock
+_hits:   int
+_misses: int
 ```
-
----
 
 #### `make_key(agent_name, requester_context) → str`
 
-Generates a deterministic cache key as an MD5 hex digest.
+Deterministic MD5 hex digest over:
+1. agent label
+2. `sorted(protocols)` — order-independent
+3. `json.dumps(location, sort_keys=True)` — key-order-independent
 
-Key inputs:
-1. `agent_name` (label string)
-2. `sorted(protocols)` — sorted to ensure `["A2A", "http"]` and `["http", "A2A"]` produce the same key
-3. `json.dumps(location, sort_keys=True)` — sorted JSON to ensure `{"city":"Boston"}` is always the same string
-
-Raw input example:
-```
-"emailer|['A2A', 'http']|{"city": "Boston"}"
-```
-Digest: `MD5(raw).hexdigest()` → `"a3f2c1d8..."`
-
-MD5 is used here for speed (not security). The key space is collision-resistant enough for this use case.
-
----
+MD5 used for speed (not security). Collision-resistant enough for this key space.
 
 #### `get(key) → Optional[Any]` (async)
 
-1. Acquires `_lock`.
-2. Looks up `key` in `_store`.
-3. If not found: increments `_misses`, returns `None`.
-4. If found: checks `time.monotonic() > expiry`.
-   - If expired: deletes entry, increments `_misses`, returns `None`.
-   - If valid: increments `_hits`, returns `payload`.
-
-`time.monotonic()` is used (not `time.time()`) because it is guaranteed to never go backwards — wall clock changes (NTP, DST) cannot cause cache entries to appear unexpired or prematurely expired.
-
----
+Checks `time.monotonic() > expiry`. Uses monotonic clock — immune to NTP/DST wall-clock jumps.
 
 #### `set(key, payload, ttl) → None` (async)
 
-1. Acquires `_lock`.
-2. Stores `(payload, time.monotonic() + ttl)` at `key`.
-
-Overwrites any existing entry for the same key. No max-size limit — the `purge_expired()` call in `_health_loop()` is the only eviction mechanism. This is acceptable because the number of distinct (label + context) combinations in a typical system is bounded.
-
----
-
-#### `invalidate(agent_name) → int` (async)
-
-Removes cache entries tagged with `_cache_key_agent == agent_name`. Used when an agent is deregistered to ensure stale resolutions are not served.
-
-Note: because cache keys are MD5 hashes, they cannot be reverse-looked-up. The `_cache_key_agent` tag (added transiently to the payload before storage) enables reverse lookup.
-
----
-
-#### `clear() → int` (async)
-
-Wipes the entire store, resets hit/miss counters, returns the number of entries removed.
-
----
-
-#### `stats() → Dict` (async)
-
-Reads `_store`, `_hits`, `_misses` under lock. Computes:
-- `active_entries` — entries where `monotonic() < expiry`
-- `expired_entries` — entries past their TTL that haven't been purged yet
-- `hit_rate_pct` — `hits / (hits + misses) * 100`
-
----
+Stores `(payload, monotonic() + ttl)`.
 
 #### `purge_expired() → int` (async)
 
-Scans the store for expired entries and deletes them. Called by `_health_loop()` every `HEALTH_INTERVAL` seconds to prevent unbounded memory growth. Returns count of entries removed.
+Evicts all expired entries. Called by `_health_loop()` every sweep to bound memory growth.
+
+#### `invalidate(agent_name) → int` (async)
+
+Removes cache entries tagged with `_cache_key_agent == agent_name`. Used on deregistration.
 
 ---
 
-### 5.5 `urn_parser.py` — URN Parsing
+### 5.8 `urn_parser.py` — URN Parsing
 
 **File:** `agentns/urn_parser.py`  
-**Purpose:** Parse, build, and validate Agent URNs. No I/O, no dependencies beyond the standard library.
+**Purpose:** Parse, build, and validate Agent URNs. No I/O, no external dependencies.
 
 #### URN Format
 
@@ -1066,21 +816,11 @@ Scans the store for expired entries and deletes them. Called by `_health_loop()`
 urn : <tld> : <namespace> : <label>
 
 urn:acme.com:sales:emailer
- │       │       │       └── label     — agent role
- │       │       └────────── namespace — application/org grouping
- │       └────────────────── tld       — top-level domain (like DNS)
- └────────────────────────── literal scheme prefix
+ │       │       │       └── label     — agent role ("emailer", "alerts")
+ │       │       └────────── namespace — application/org grouping ("sales", "acme")
+ │       └────────────────── tld       — top-level domain ("agentns.local", "agents.example.com")
+ └────────────────────────── literal scheme prefix "urn"
 ```
-
-#### `ParsedURN` dataclass
-
-Fields: `tld`, `namespace`, `label`, `raw`
-
-Properties:
-- `full` — reconstructs the canonical URN string from parts, omitting empty segments
-- `matches_namespace(tld, namespace)` — boolean check used by namespace routing
-
----
 
 #### `parse_urn(value) → ParsedURN`
 
@@ -1090,70 +830,143 @@ Never raises. Handles all input forms:
 |-------|-----|-----------|-------|
 | `"urn:acme.com:sales:emailer"` | `acme.com` | `sales` | `emailer` |
 | `"urn:agentns.local:emailer"` | `agentns.local` | `""` | `emailer` |
-| `"sales:emailer"` | `sales` | `""` | `emailer` |
 | `"emailer"` | `""` | `""` | `emailer` |
-
-Algorithm:
-1. Strip whitespace.
-2. Strip leading `"urn:"` prefix (case-insensitive).
-3. Split on `":"`.
-4. If 3+ parts: `tld=parts[0]`, `namespace=parts[1]`, `label=":".join(parts[2:])` (handles colons in label).
-5. If 2 parts: `tld=parts[0]`, `namespace=""`, `label=parts[1]`.
-6. If 1 part: all empty except `label=parts[0]`.
-
----
 
 #### `build_urn(tld, namespace, label) → str`
 
-Simple f-string: `f"urn:{tld}:{namespace}:{label}"`. Used to construct the `agent_name` field stored in the registry.
-
----
+Constructs `f"urn:{tld}:{namespace}:{label}"`. Used to set `agent_name` on every registered endpoint.
 
 #### `extract_label(value) → str`
 
-Convenience function. Calls `parse_urn()` and returns `.label`. If label is empty (malformed URN), returns the original string. Used in edge cases where the input might already be a plain label.
+Shortcut: `parse_urn(value).label`. Returns original string if label is empty.
 
 ---
 
-### 5.6 Python Client SDK
+### 5.9 `registry_adapter.py` — Pluggable Backends
 
-The Python SDK is split into two modules:
+**File:** `agentns/registry_adapter.py`  
+**Purpose:** Abstract interface for custom registry backends. Allows agentns to delegate resolution to an external service.
 
-| Module | Purpose |
-|--------|---------|
-| `agentns/requester_lib.py` | Resolve other agents — use when you want to **call** someone |
-| `agentns/target_lib.py` | Register yourself — use when you **are** the target |
+#### Provided Adapters
 
-#### `requester_lib` — resolve agents
+| Class | Description |
+|-------|-------------|
+| `HttpRegistryAdapter` | Forwards resolve calls to any HTTP registry endpoint |
+| `StaticRegistryAdapter` | In-memory dict or YAML file — for static environments |
+| `MultiRegistryAdapter` | Fan-out: tries multiple registries in order (primary + fallback) |
+| `RegistryAdapter` (ABC) | Base class — implement `resolve()` and `health()` |
 
-Key types: `AgentName`, `RequesterContext`, `Query`, `TailoredEndpoint`, `RequesterAgentClient`
+#### Custom Adapter Example
 
-Entry point:
 ```python
-client = agentns.requester_lib.connect()   # reads AGENTNS_URL + AGENTNS_API_KEY from env
+from agentns.registry_adapter import RegistryAdapter
+import httpx
+
+class ConsulAdapter(RegistryAdapter):
+    async def resolve(self, agent_path, requester_context):
+        label = agent_path.split(":")[-1]
+        async with httpx.AsyncClient() as c:
+            r = await c.get(f"http://consul:8500/v1/health/service/{label}?passing=true")
+        services = r.json()
+        if not services:
+            return None
+        svc = services[0]["Service"]
+        return {"endpoint": f"http://{svc['Address']}:{svc['Port']}", "protocol": "A2A", "ttl": 30}
+
+    async def health(self):
+        return {"status": "ok"}
+```
+
+#### Activation
+
+```bash
+REGISTRY_ADAPTER=static  REGISTRY_YAML=/etc/agentns/agents.yaml  agentns-server
+REGISTRY_ADAPTER=multi   REGISTRY_URLS=http://primary:6900,http://backup:6900  agentns-server
+```
+
+---
+
+### 5.10 `auth.py` — Security Headers
+
+**File:** `agentns/auth.py`  
+**Purpose:** Security headers middleware. No API key authentication — agentns is designed for sidecar/internal network deployments.
+
+#### `security_headers_middleware(request, call_next) → Response`
+
+Injects security headers on every response:
+
+```
+X-Content-Type-Options: nosniff
+X-Frame-Options:        DENY
+X-XSS-Protection:       1; mode=block
+Referrer-Policy:        no-referrer
+Cache-Control:          no-store
+```
+
+Registered via `app.middleware("http")` in `server.py`.
+
+**Note:** API key authentication was intentionally removed. agentns assumes it runs on an internal network (sidecar, VPC, Kubernetes cluster). For public deployments, put it behind a reverse proxy (nginx, Traefik, API Gateway) that handles authentication at the edge.
+
+---
+
+### 5.11 `target_lib.py` — Agent Registration SDK
+
+**File:** `agentns/target_lib.py`  
+**Purpose:** Python SDK for agents that want to register themselves.
+
+```python
+import agentns
+
+# Connect (reads AGENTNS_URL from env)
+client = agentns.target_lib.connect()
+
+# Register at startup
+await client.record(agentns.DeploymentSpec(
+    leaf_name  = "alerts",
+    a2a_url    = "http://myhost:9001",
+    health_url = "http://myhost:9001/health",
+    region     = "us-east",
+    location   = {"city": "Boston"},
+    protocols  = ["A2A"],
+))
+
+# Deregister at shutdown
+await client.deregister("alerts", "http://myhost:9001")
+```
+
+`record()` retries automatically (default 3 attempts, 2s backoff). Safe to call at startup before agentns is fully ready.
+
+`deregister()` uses a URL query parameter (`?endpoint=...`) instead of a request body so it works through cloud HTTP proxies that strip DELETE request bodies.
+
+---
+
+### 5.12 `requester_lib.py` — Agent Resolution SDK
+
+**File:** `agentns/requester_lib.py`  
+**Purpose:** Python SDK for agents that want to resolve and call other agents.
+
+```python
+import agentns
+
+# Connect (reads AGENTNS_URL from env)
+client = agentns.requester_lib.connect()
+
+# Resolve to a URL
 endpoint = await client.resolve(agentns.Query.from_label("alerts"))
+if endpoint:
+    resp = await httpx.AsyncClient().post(endpoint.url, json={...})
+
+# Or with context
+endpoint = await client.resolve(agentns.Query(
+    agent_name        = agentns.AgentName.from_label("alerts"),
+    requester_context = agentns.RequesterContext(
+        location  = {"city": "Boston"},
+        protocols = ["A2A"],
+    ),
+))
 ```
 
-`resolve()` never raises — returns `None` on any failure so the caller can implement its own fallback.
-
-#### `target_lib` — register agents
-
-Key types: `DeploymentSpec`, `TargetAgentClient`
-
-Entry point:
-```python
-client = agentns.target_lib.connect()   # reads AGENTNS_URL + AGENTNS_API_KEY from env
-await client.record(agentns.DeploymentSpec(leaf_name="alerts", a2a_url="http://host:9001"))
-```
-
-`record()` retries automatically (default 3 attempts, 2s backoff) — safe to call at agent startup
-even if agentns is still initializing.
-
-`deregister()` passes the endpoint as a URL query parameter (not a request body) so it works
-reliably through cloud HTTP proxies that strip DELETE request bodies.
-
-See the module docstrings in [`agentns/requester_lib.py`](agentns/requester_lib.py) and
-[`agentns/target_lib.py`](agentns/target_lib.py) for full API reference.
+`resolve()` never raises — returns `None` on any failure so callers implement their own fallback.
 
 ---
 
@@ -1163,13 +976,13 @@ See the module docstrings in [`agentns/requester_lib.py`](agentns/requester_lib.
 
 ```python
 {
-    "endpoint":         "http://ny-host:9001",           # required
-    "health_check_url": "http://ny-host:9001/health",    # optional, empty if auto-discover
-    "namespace":        "agents.local",                   # URN namespace
-    "protocols":        ["http", "A2A"],                  # supported protocols
-    "region":           "us-east",                        # region code
-    "region_label":     "New York, NY",                   # human-readable
-    "flag":             "🇺🇸",                             # emoji flag
+    "endpoint":         "http://ny-host:9001",
+    "health_check_url": "http://ny-host:9001/health",  # empty if auto-discover
+    "namespace":        "agents.local",
+    "protocols":        ["A2A"],
+    "region":           "us-east",
+    "region_label":     "New York, NY",
+    "flag":             "🇺🇸",
     "location": {
         "city":         "New York",
         "latitude":     40.7128,
@@ -1183,11 +996,11 @@ See the module docstrings in [`agentns/requester_lib.py`](agentns/requester_lib.
 
 ```python
 {
-    "status":           "healthy",      # "healthy" | "degraded" | "unhealthy" | "unknown"
-    "load":             42.5,           # 0–100, defaults to 50 if not reported
-    "response_time_ms": 87.3,           # round-trip to health URL in ms
+    "status":           "healthy",   # "healthy" | "degraded" | "unhealthy" | "unknown"
+    "load":             42.5,        # 0–100, default 50 if not reported
+    "response_time_ms": 87.3,        # round-trip to health URL in ms
     "last_check":       "2025-04-17T14:23:01.456789+00:00",
-    "reason":           ""              # populated only on unhealthy
+    "reason":           ""           # populated only on unhealthy
 }
 ```
 
@@ -1196,6 +1009,7 @@ See the module docstrings in [`agentns/requester_lib.py`](agentns/requester_lib.
 ```python
 {
     "endpoint":             "http://lon-host:9001",
+    "url":                  "http://lon-host:9001",    # alias for endpoint
     "protocol":             "A2A",
     "ttl":                  60,
     "region":               "London, UK",
@@ -1208,22 +1022,8 @@ See the module docstrings in [`agentns/requester_lib.py`](agentns/requester_lib.
         "latency_ms":       210.0,
         "total_candidates": 2,
         "all_candidates": [
-            {
-                "endpoint":   "http://lon-host:9001",
-                "region":     "London, UK",
-                "flag":       "🇬🇧",
-                "status":     "healthy",
-                "latency_ms": 210.0,
-                "load":       20.0
-            },
-            {
-                "endpoint":   "http://ny-host:9001",
-                "region":     "New York, NY",
-                "flag":       "🇺🇸",
-                "status":     "healthy",
-                "latency_ms": 45.0,
-                "load":       30.0
-            }
+            {"endpoint": "http://lon-host:9001", "status": "healthy", "latency_ms": 210.0},
+            {"endpoint": "http://ny-host:9001",  "status": "healthy", "latency_ms": 45.0}
         ]
     }
 }
@@ -1233,19 +1033,19 @@ See the module docstrings in [`agentns/requester_lib.py`](agentns/requester_lib.
 
 ```javascript
 {
-    "_id":          ObjectId("..."),          // MongoDB internal
-    "label":        "emailer",                // indexed
-    "endpoint":     "http://ny-host:9001",    // part of unique compound index
-    "health_check_url": "http://ny-host:9001/health",
-    "namespace":    "agents.local",
-    "protocols":    ["http", "A2A"],
-    "region":       "us-east",
-    "region_label": "New York, NY",
-    "flag":         "🇺🇸",
-    "location":     {"city": "New York", "latitude": 40.7128, "longitude": -74.006},
-    "agent_name":   "urn:agentns.local:agents.local:emailer",
-    "registered_at": ISODate("2025-04-17T10:00:00Z"),  // $setOnInsert — never changes
-    "last_seen":     ISODate("2025-04-17T14:23:01Z")   // updated on every re-registration
+    "_id":               ObjectId("..."),
+    "label":             "emailer",              // indexed
+    "endpoint":          "http://ny-host:9001",  // part of unique compound index
+    "health_check_url":  "http://ny-host:9001/health",
+    "namespace":         "agents.local",
+    "protocols":         ["A2A"],
+    "region":            "us-east",
+    "region_label":      "New York, NY",
+    "flag":              "🇺🇸",
+    "location":          {"city": "New York", "latitude": 40.7128, "longitude": -74.006},
+    "agent_name":        "urn:agentns.local:agents.local:emailer",
+    "registered_at":     ISODate("2025-04-17T10:00:00Z"),  // $setOnInsert — never changes
+    "last_seen":         ISODate("2025-04-17T14:23:01Z")   // updated on every re-registration
 }
 ```
 
@@ -1253,7 +1053,7 @@ See the module docstrings in [`agentns/requester_lib.py`](agentns/requester_lib.
 
 ## 7. Server Selection Algorithm
 
-The ranking algorithm is the intellectual core of agentns. It answers: *"Given N endpoints registered for label X, and a request from location L wanting protocol P, which endpoint should answer?"*
+The ranking algorithm answers: *"Given N endpoints for label X, and a request from location L wanting protocol P, which endpoint should answer?"*
 
 ### Sort Key
 
@@ -1261,15 +1061,13 @@ The ranking algorithm is the intellectual core of agentns. It answers: *"Given N
 (health_score, protocol_score, geo_distance_km, response_time_ms, load_percent)
 ```
 
-Each position is only consulted when all positions to its left are tied. This creates a strict priority hierarchy.
+Each position is only consulted when all positions to its left are tied — strict priority hierarchy.
 
-### Priority 1: Health Status
+### Priority 1: Health
 
 ```
-healthy (0) >> degraded (1) >> unknown (2) >> unhealthy (3, excluded)
+healthy (0) >> degraded (1) >> unknown (2) >> unhealthy (excluded)
 ```
-
-A degraded endpoint (slow but alive) is always preferred over an unknown one (not yet probed). Unhealthy endpoints are completely removed from the candidate list before sorting.
 
 ### Priority 2: Protocol Compatibility
 
@@ -1277,62 +1075,49 @@ A degraded endpoint (slow but alive) is always preferred over an unknown one (no
 preferred protocol available (0) >> not available (1)
 ```
 
-If the caller wants A2A but an endpoint only supports HTTP, it scores 1. An endpoint supporting A2A scores 0. Among equally healthy endpoints, protocol-compatible ones always win.
-
 ### Priority 3: Geographic Distance
 
-```python
-distance_km = haversine(requester_lat, requester_lon, server_lat, server_lon)
-# Returns math.inf if either party has no known location
 ```
-
-A Boston requester calling `resolve()` gets New York (306 km) over Frankfurt (6,200 km) — even if Frankfurt has lower latency at that moment. Geographic proximity is the stronger signal because:
-- It correlates with compliance (data sovereignty)
-- Network latency and geo distance are strongly correlated at global scale
-- Geo stability is more predictable than momentary latency measurements
-
-If no location is provided (or no server has location data), all geo distances are `math.inf` and the sort falls through to latency.
+haversine(requester, server) in km
+math.inf if no location data → falls through to latency
+```
 
 ### Priority 4: Response Time
 
-```python
-health.get("response_time_ms", 9999.0)
 ```
-
-Measured round-trip in milliseconds from the most recent health sweep. Within the same geo zone (or when no location provided), the fastest endpoint wins. 9999ms default for unknown-latency endpoints pushes them below measured ones.
+health.get("response_time_ms", 9999.0) — lower is better
+```
 
 ### Priority 5: CPU Load
 
-```python
-health.get("load", 50.0)
 ```
-
-Load percent (0–100) from the agent's health endpoint JSON. Final tiebreaker when everything else is equal. 50% default for endpoints that don't report load.
+health.get("load", 50.0) — lower is better (0–100%)
+```
 
 ### Worked Example
 
-Two replicas for `emailer`, requester in Boston:
+Two replicas, requester in Boston:
 
 ```
-               NYC               London
-health_score:   0 (healthy)       0 (healthy)
-proto_score:    0 (A2A ✓)         0 (A2A ✓)
-geo_km:         306 km            5,263 km
-latency_ms:     45 ms             210 ms
-load:           30%               20%
+               NYC (45ms, 30% load)     London (210ms, 20% load)
+health_score:   0 (healthy)              0 (healthy)
+proto_score:    0 (A2A ✓)               0 (A2A ✓)
+geo_km:         306 km                  5,263 km
+latency_ms:     45 ms                   210 ms
+load:           30%                     20%
 
-NYC sort key:    (0, 0,  306, 45,  30)
-London sort key: (0, 0, 5263, 210, 20)
+Sort keys:
+  NYC:    (0, 0,  306, 45,  30)
+  London: (0, 0, 5263, 210, 20)
 
 NYC wins at position 3 (geo_km 306 < 5263)
 selected_by = "geo_nearest"
 ```
 
-Same example, no location provided:
-
+Without location:
 ```
-NYC sort key:    (0, 0, inf, 45,  30)
-London sort key: (0, 0, inf, 210, 20)
+  NYC:    (0, 0, inf, 45,  30)
+  London: (0, 0, inf, 210, 20)
 
 NYC wins at position 4 (latency_ms 45 < 210)
 selected_by = "lowest_latency"
@@ -1340,37 +1125,114 @@ selected_by = "lowest_latency"
 
 ---
 
-## 8. Concurrency Model
+## 8. MongoDB Integration
 
-agentns uses **cooperative multitasking** via Python's asyncio. There are no threads.
+### Overview
 
-### Event Loop Tasks
+MongoDB provides **optional persistence** — the registry survives process restarts without requiring all agents to re-register. It is not required for operation.
 
-At runtime, the asyncio event loop runs multiple coroutines concurrently:
+### Connection
+
+Set `MONGODB_URI` to any valid MongoDB connection string:
+
+```bash
+# Local MongoDB
+MONGODB_URI=mongodb://localhost:27017/
+
+# MongoDB Atlas (cloud)
+MONGODB_URI="mongodb+srv://user:pass@cluster0.abc.mongodb.net/"
+
+# Local with auth
+MONGODB_URI="mongodb://agentns:secret@mongo:27017/agentns"
+```
+
+Leave unset for in-memory-only mode.
+
+### Indexes Created at Startup
+
+```javascript
+// Fast lookups by agent name
+db.agents.createIndex({ "label": 1 })
+
+// Prevent duplicate registrations, enables upsert semantics
+db.agents.createIndex({ "label": 1, "endpoint": 1 }, { unique: true })
+```
+
+### Upsert Semantics
+
+Every `POST /register` call performs:
+
+```python
+await _mongo_col.update_one(
+    {"label": label, "endpoint": entry["endpoint"]},   # unique identity
+    {
+        "$set":         {**entry_doc, "last_seen": now},   # always update
+        "$setOnInsert": {"registered_at": now},             # only on first insert
+    },
+    upsert=True,
+)
+```
+
+Calling `/register` 100 times with the same `(label, endpoint)` produces **exactly one document**. `registered_at` is set on creation and never changes. `last_seen` is updated on every call.
+
+### Failure Handling
+
+| Failure scenario | Behavior |
+|-----------------|----------|
+| MongoDB unreachable at startup | Log warning, continue in-memory mode |
+| MongoDB write fails during /register | Log error, registration still succeeds in-memory |
+| MongoDB load fails at startup | Log error, start with empty registry |
+| MongoDB disconnects at runtime | In-memory registry continues; writes logged as errors |
+
+MongoDB failures **never** prevent startup or cause the server to stop accepting requests.
+
+### What Persists vs. What Doesn't
+
+| Persisted in MongoDB | Not persisted |
+|---------------------|---------------|
+| Endpoint registrations (all fields) | Health check results |
+| registration_at / last_seen timestamps | Resolution cache |
+| Namespace, region, location metadata | Background task state |
+
+Health data is intentionally not persisted — it's ephemeral and becomes stale immediately. The initial health sweep on startup gets fresh data within seconds.
+
+### Docker Compose with Local MongoDB
+
+```bash
+# Start agentns + local MongoDB together
+docker compose --profile mongo up
+
+# With MongoDB Atlas
+MONGODB_URI="mongodb+srv://..." docker compose up
+```
+
+---
+
+## 9. Concurrency Model
+
+agentns uses **cooperative multitasking** via Python's asyncio. No threads.
+
+### Event Loop Structure
 
 ```
 asyncio event loop
-    ├── uvicorn ASGI server          (handles HTTP connections)
-    │     ├── resolve() coroutine     (per incoming request)
-    │     ├── register() coroutine    (per incoming request)
-    │     └── health() coroutine      (per incoming request)
+    ├── uvicorn ASGI server        (handles HTTP connections)
+    │     ├── proxy_agent()        (per /proxy/* request)
+    │     ├── resolve()            (per /resolve request)
+    │     ├── register()           (per /register request)
+    │     └── health() / agents()  (per monitoring request)
     │
-    └── _health_loop() task          (background, started in lifespan)
-          └── _check_all()           (every HEALTH_INTERVAL seconds)
-                └── asyncio.gather() (all endpoint probes in parallel)
+    └── _health_loop() task        (background, started in lifespan)
+          └── _check_all()         (asyncio.gather — all probes parallel)
 ```
 
-### Shared State and Locking
+### Locking
 
-Only `_health_cache` requires a lock because it is written by both:
-1. `_check_all()` (background loop)
-2. The live-check block inside `resolve()` (request handlers)
-
-The `asyncio.Lock` (`_health_lock`) ensures that concurrent writes do not corrupt the dict. Because asyncio is single-threaded, lock contention is only possible at `await` yield points — lock acquisition is almost always instant.
-
-`_registry` does **not** have a lock. Modifications only happen in `register()` and `deregister()` which are regular (non-concurrent) HTTP handlers. In asyncio, dict mutations between yield points are atomic.
-
-`_cache` has its own internal `asyncio.Lock` within `ResolutionCache`.
+| State | Lock | Reason |
+|-------|------|--------|
+| `_health_cache` | `_health_lock` (asyncio.Lock) | Written by both background loop and resolve() inline checks |
+| `_registry` | None needed | Only mutated in register()/deregister() — no concurrent writes |
+| `_cache` | Internal lock in ResolutionCache | get/set/purge from multiple coroutines |
 
 ### Health Probe Parallelism
 
@@ -1378,81 +1240,58 @@ The `asyncio.Lock` (`_health_lock`) ensures that concurrent writes do not corrup
 await asyncio.gather(*[_check_one(u, h) for u, h in seen.items()], return_exceptions=True)
 ```
 
-All health probes execute concurrently. For 10 endpoints, the sweep takes as long as the slowest individual probe (5s timeout), not 50s. `return_exceptions=True` ensures one timed-out probe does not cancel the others.
+For 50 endpoints with 5s timeout each: sequential = 250s, parallel = 5s max. `return_exceptions=True` — one timed-out probe does not cancel the others.
 
 ---
 
-## 9. Persistence Layer
+## 10. API Reference
 
-### In-Memory Mode (default)
+### `ANY /proxy/{label}` and `ANY /proxy/{label}/{path}`
 
-When `MONGODB_URI` is not set:
-- `_registry` lives only in process memory
-- On restart: all dynamically registered agents are lost
-- Static agents (hardcoded in code) survive restarts
-- Suitable for: local development, single-process deployments, ephemeral environments
+Forward any request to the best healthy endpoint registered under `label`.
 
-### MongoDB Mode
+```bash
+# Forward a message to the "alerts" agent:
+curl -X POST http://localhost:8200/proxy/alerts \
+  -H "Content-Type: application/json" \
+  -d '{"method": "message/send", "params": {"text": "hello"}}'
 
-When `MONGODB_URI` is set:
-- Every `POST /register` call upserts to MongoDB
-- On startup: `_load_from_mongo()` restores the registry before the first health sweep
-- The full startup sequence including MongoDB load and initial health sweep completes before the first HTTP request is accepted
-- Suitable for: production deployments, multi-instance deployments, any environment where agents do not re-register on every startup
+# Forward with a sub-path:
+curl http://localhost:8200/proxy/alerts/tasks/list
 
-### MongoDB Upsert Semantics
-
-```python
-await _mongo_col.update_one(
-    {"label": label, "endpoint": entry["endpoint"]},   # filter = unique identity
-    {
-        "$set":         {**doc, "last_seen": now},      # always update
-        "$setOnInsert": {"registered_at": now},          # only on first insert
-    },
-    upsert=True,
-)
+# Fetch A2A agent card (url field auto-rewritten to proxy URL):
+curl http://localhost:8200/proxy/alerts/.well-known/agent.json
 ```
 
-This is idempotent: calling `POST /register` with the same `(label, endpoint)` 100 times produces exactly one MongoDB document, with `registered_at` set on the first call and `last_seen` updated on every subsequent call.
+All HTTP methods supported. SSE streaming works transparently.
+
+**Responses:**
+- `200` — upstream responded
+- `404` — label not registered
+- `502` — upstream connection refused
+- `504` — upstream timed out
 
 ---
-
-## 10. Configuration Reference
-
-All configuration is via environment variables. No config files. No hardcoded values.
-
-| Variable | Default | Type | Description |
-|----------|---------|------|-------------|
-| `AGENTNS_PORT` | `8200` | int | HTTP port the server listens on |
-| `AGENTNS_NAMESPACE` | `agents.local` | str | Default URN namespace for newly registered agents |
-| `AGENTNS_TLD` | `agentns.local` | str | URN TLD used in `agent_name` construction |
-| `AGENTNS_HEALTH_INTERVAL` | `30` | int | Seconds between background health sweeps |
-| `MONGODB_URI` | `""` | str | MongoDB connection string. Empty = in-memory mode |
-| `MONGODB_DB` | `agentns` | str | MongoDB database name |
-| `AGENTNS_URL` | `http://localhost:8200` | str | Used by `AgentNSClient()` with no arguments |
-
----
-
-## 11. API Reference
 
 ### `POST /register`
 
 Register or update an agent endpoint.
 
-**Request:**
+**Request body:**
 ```json
 {
-  "label":           "emailer",
-  "endpoint":        "http://host:9001",
-  "namespace":       "acme.sales",
-  "region":          "us-east",
-  "region_label":    "New York, NY",
-  "location":        {"city": "New York"},
-  "protocols":       ["http", "A2A"],
-  "health_check_url":"http://host:9001/health",
-  "flag":            "🇺🇸"
+  "label":            "emailer",
+  "endpoint":         "http://host:9001",
+  "namespace":        "acme.sales",
+  "region":           "us-east",
+  "location":         {"city": "New York"},
+  "protocols":        ["A2A"],
+  "health_check_url": "http://host:9001/health",
+  "flag":             "🇺🇸"
 }
 ```
+
+Only `label` and `endpoint` are required.
 
 **Response 200:**
 ```json
@@ -1461,34 +1300,38 @@ Register or update an agent endpoint.
   "label":           "emailer",
   "endpoint":        "http://host:9001",
   "agent_name":      "urn:agentns.local:acme.sales:emailer",
-  "total_endpoints": 1
+  "total_endpoints": 1,
+  "geo_routing":     "active"
 }
 ```
 
+`"status"` is `"updated"` if the endpoint was already registered (idempotent).  
 **Response 400:** `label` or `endpoint` missing.
 
 ---
 
 ### `POST /resolve`
 
-Resolve an agent to its best available endpoint.
+Resolve an agent label or URN to its best available endpoint URL.
 
-**Request:**
+**Request body:**
 ```json
 {
-  "agent_name": "urn:agentns.local:acme.sales:emailer",
+  "label": "emailer",
   "requester_context": {
     "location":  {"city": "Boston"},
     "protocols": ["A2A", "http"]
-  },
-  "cache_enabled": true
+  }
 }
 ```
+
+Also accepts `"agent_name"` (URN) in place of `"label"`.
 
 **Response 200:**
 ```json
 {
   "endpoint":           "http://host:9001",
+  "url":                "http://host:9001",
   "protocol":           "A2A",
   "ttl":                60,
   "region":             "New York, NY",
@@ -1506,6 +1349,7 @@ Resolve an agent to its best available endpoint.
 ```
 
 **Response 400:** No `agent_name` or `label` provided.  
+**Response 403:** URN TLD or namespace doesn't match this server.  
 **Response 404:** Label not registered.
 
 ---
@@ -1514,11 +1358,18 @@ Resolve an agent to its best available endpoint.
 
 Remove one or all endpoints for a label.
 
-**Request body (optional):**
-```json
-{"endpoint": "http://host:9001"}
+```bash
+# Remove a specific endpoint (body):
+curl -X DELETE http://localhost:8200/register/emailer \
+  -H "Content-Type: application/json" \
+  -d '{"endpoint": "http://host:9001"}'
+
+# Remove a specific endpoint (query param, cloud-proxy safe):
+curl -X DELETE "http://localhost:8200/register/emailer?endpoint=http://host:9001"
+
+# Remove all endpoints for label:
+curl -X DELETE http://localhost:8200/register/emailer
 ```
-Omit body or set endpoint to `""` to remove all endpoints for the label.
 
 **Response 200:**
 ```json
@@ -1529,23 +1380,107 @@ Omit body or set endpoint to `""` to remove all endpoints for the label.
 
 ### `GET /health`
 
-Full service health report. HTTP 200 always (even when agents are unhealthy — the sidecar itself is up).
+Full server health report. Always returns HTTP 200.
+
+```json
+{
+  "ok": true,
+  "status": "healthy",
+  "version": "3.0.0",
+  "total_labels": 3,
+  "total_endpoints": 5,
+  "mongodb": "connected",
+  "proxy": {
+    "enabled": true,
+    "mode": "agentgateway",
+    "endpoint": "http://agentgateway:8400",
+    "slim_org": ""
+  },
+  "agents": {
+    "emailer": [
+      {"endpoint": "http://host:9001", "status": "healthy", "latency_ms": 45.0}
+    ]
+  }
+}
+```
+
+---
 
 ### `GET /agents`
 
-All registered labels with per-endpoint health status.
+All registered labels with per-endpoint health status. Designed for dashboards.
 
 ### `GET /namespaces`
 
-All namespaces and the labels registered under each.
+All namespaces and the labels in each:
+```json
+{"tld": "agentns.local", "namespaces": {"agents.local": ["emailer", "alerts"]}}
+```
 
 ### `GET /cache/stats`
 
-Cache hit rate and entry counts.
+Cache hit rate and entry counts:
+```json
+{"hits": 42, "misses": 8, "hit_rate_pct": 84.0, "active_entries": 5, "expired_entries": 0}
+```
 
 ### `POST /cache/clear`
 
-Flush the resolution cache. Does not affect `_registry` or `_health_cache`.
+Flush all cached resolutions:
+```json
+{"status": "cleared", "removed": 5}
+```
+
+---
+
+## 11. Configuration Reference
+
+All configuration is via environment variables. No config files, no hardcoded values.
+
+### Server Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `AGENTNS_PORT` | `8200` | HTTP port |
+| `AGENTNS_NAMESPACE` | `agents.local` | Default URN namespace for new registrations |
+| `AGENTNS_TLD` | `agentns.local` | URN TLD used in `agent_name` construction |
+| `AGENTNS_HEALTH_INTERVAL` | `30` | Seconds between background health sweeps |
+| `AGENTNS_GEOCODING` | `on` | Set `off` to disable Nominatim geocoding |
+
+### MongoDB Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `MONGODB_URI` | *(none)* | MongoDB connection string. Empty = in-memory mode |
+| `MONGODB_DB` | `agentns` | MongoDB database name |
+
+### Proxy Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `AGENTNS_PROXY_HOST` | *(none)* | Optional external proxy hostname (e.g., Agentgateway) |
+| `AGENTNS_PROXY_PORT` | `8400` | External proxy port |
+| `AGENTNS_PROXY_MODE` | `agentgateway` | `agentgateway` or `custom` |
+| `A2A_PROXY_ENDPOINTS` | *(none)* | Explicit comma-separated proxy base URLs (overrides HOST+PORT) |
+| `SLIM_ORG` | *(none)* | SLIM org prefix for `slim_identity` |
+
+### Registry Adapter Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `REGISTRY_ADAPTER` | `http` | `http` / `static` / `multi` |
+| `REGISTRY_URL` | `http://localhost:6900` | HTTP registry URL |
+| `REGISTRY_YAML` | `agents.yaml` | Static registry YAML path |
+| `REGISTRY_URLS` | *(none)* | Comma-separated URLs for multi-adapter |
+
+### Client Variables (used by target_lib / requester_lib)
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `AGENTNS_URL` | `http://localhost:8200` | Server URL used by both client SDKs |
+| `AGENTNS_RESOLVER_URL` | *(AGENTNS_URL)* | Override resolver URL separately |
+| `ANS_TLD` | `agentns.local` | TLD for `AgentName.from_label()` |
+| `ANS_APP` | `default` | Namespace for `AgentName.from_label()` |
 
 ---
 
@@ -1553,31 +1488,36 @@ Flush the resolution cache. Does not affect `_registry` or `_health_cache`.
 
 ### Principle: Never Crash the Caller
 
-Every code path in agentns is designed to return a response rather than propagate an unhandled exception.
+Every code path returns a response rather than propagating an unhandled exception.
 
 | Scenario | Behavior |
 |----------|----------|
-| MongoDB unreachable at startup | Logs error, continues in-memory mode |
-| MongoDB write fails during register | Logs error, registration still succeeds in-memory |
-| MongoDB load fails at startup | Logs error, starts with empty registry |
-| Health probe times out | Returns `_unhealthy("timeout")`, endpoint marked unhealthy |
-| Health probe connection refused | Returns `_unhealthy("connection refused")` |
-| All endpoints unhealthy during resolve | Returns `emergency_fallback` with first endpoint, TTL=5 |
-| One probe in gather() throws | `return_exceptions=True` — other probes continue |
-| Background health loop iteration fails | Logs warning, sleeps, retries next iteration |
-| `AgentNSClient.resolve()` throws | Catches all exceptions, returns `None` |
-| Unknown status in `_health_score()` | Defaults to `2` (unknown) |
-| City name not in `CITY_COORDS` | Returns `None` from `_resolve_location()`, disables geo |
+| MongoDB unreachable at startup | Log error, continue in-memory |
+| MongoDB write fails during /register | Log error, registration succeeds in-memory |
+| MongoDB load fails at startup | Log error, start with empty registry |
+| Health probe times out | `_unhealthy("timeout")` |
+| Health probe connection refused | `_unhealthy("connection refused")` |
+| All endpoints unhealthy during resolve | `emergency_fallback` with TTL=5, HTTP 200 |
+| One probe in gather() throws | `return_exceptions=True` — others continue |
+| Background health loop iteration fails | Log warning, sleep, retry |
+| Proxy upstream connection refused | HTTP 502 Bad Gateway |
+| Proxy upstream timed out | HTTP 504 Gateway Timeout |
+| `requester_lib.resolve()` throws | Catches all, returns `None` |
+| Unknown status in `_health_score()` | Defaults to 2 (unknown) |
+| City not in CITY_COORDS | Returns `None`, disables geo ranking |
 
-### HTTP Error Codes
+### HTTP Status Codes
 
 | Code | When |
 |------|------|
-| 400 | Missing required fields (`label`, `endpoint`, `agent_name`) |
-| 404 | Label not registered when resolving or deregistering |
-| 200 | All success cases, including `emergency_fallback` |
+| 200 | All success cases, including emergency_fallback |
+| 400 | Missing required fields |
+| 403 | URN TLD or namespace mismatch |
+| 404 | Label not registered (resolve / deregister) |
+| 502 | Proxy: upstream refused connection |
+| 504 | Proxy: upstream timed out |
 
-The 200 for emergency fallback is intentional — returning 503 would cause orchestrators to fail hard. Returning 200 with a low TTL (5s) allows the orchestrator to call the unhealthy endpoint (which may still be partially functional) and retry resolution quickly.
+The 200 for emergency fallback is intentional — returning 503 would cause orchestrators to fail hard. A 200 with TTL=5 lets the caller try the endpoint (which may be partially functional) and retry resolution in 5 seconds.
 
 ---
 
@@ -1585,30 +1525,208 @@ The 200 for emergency fallback is intentional — returning 503 would cause orch
 
 ### Resolution Latency
 
-| Path | Typical latency |
-|------|----------------|
+| Path | Typical |
+|------|---------|
 | Cache hit | < 1 ms |
 | Cache miss, all endpoints in health cache | 1–5 ms |
-| Cache miss, one endpoint unchecked (live probe) | 50–500 ms (network dependent) |
+| Cache miss, one endpoint not yet checked (live probe) | 50–500 ms |
 
-### Health Sweep Throughput
+### Health Sweep
 
-Health sweeps run with `asyncio.gather()` — all probes are concurrent. For N endpoints:
+All probes run concurrently via `asyncio.gather()`. For N endpoints:
 - Sequential: `N × avg_probe_latency`
-- With gather: `≈ max_probe_latency` (bounded by slowest single probe)
+- With gather: `≈ max_probe_latency`
 
-For 50 endpoints with 100ms average probe latency: ~100ms sweep time vs ~5000ms sequential.
+For 50 endpoints at 100ms each: 100ms sweep vs 5000ms sequential.
 
-### Memory Usage
+### Proxy Throughput
 
-The `_registry` dict is tiny — a few KB per registered endpoint. `_health_cache` is similar. `ResolutionCache._store` holds fully serialized JSON payloads, typically 1–5 KB each.
+The proxy adds one httpx async round-trip. For in-datacenter requests: ~1–5ms added latency over direct calls. SSE streaming has no additional buffering — chunks are yielded as received.
 
-For a system with 100 agents and 500 distinct (label + context) resolution combinations: total in-memory state < 5 MB.
+### Memory
 
-### Scalability Limits
+- `_registry`: ~1–5 KB per endpoint
+- `_health_cache`: ~500 bytes per endpoint
+- `ResolutionCache._store`: 1–5 KB per distinct (label + context) combination
 
-agentns is a sidecar — one instance per orchestrator host. It is not designed for horizontal scaling of the discovery service itself. For very large systems (thousands of agents), MongoDB becomes the scaling lever: multiple agentns instances share the same MongoDB backend, each with a local in-memory cache.
+For 100 agents × 500 resolution combinations: total in-memory state < 10 MB.
 
 ---
 
-*Technical Reference — agentns v2.0.0 — DataWorksAI — MIT License*
+## 14. Deployment Guide
+
+### Minimum (in-memory, no persistence)
+
+```bash
+pip install agentns
+agentns-server
+# or
+docker run -p 8200:8200 ghcr.io/tonystark3110/agentns:latest
+```
+
+Registry is lost on restart. Agents must re-register. Fine for development and single-process setups.
+
+### Production (MongoDB Atlas)
+
+```bash
+docker run -d --restart always \
+  -p 8200:8200 \
+  -e MONGODB_URI="mongodb+srv://user:pass@cluster0.abc.mongodb.net/" \
+  ghcr.io/tonystark3110/agentns:latest
+```
+
+Open port 8200 in your firewall/security group. All agents point `AGENTNS_URL` at this server.
+
+### Full Stack (Docker Compose + local MongoDB)
+
+```bash
+# Clone repo
+git clone https://github.com/tonystark3110/agentns && cd agentns
+
+# Development (in-memory):
+docker compose up
+
+# With local MongoDB (persistent):
+docker compose --profile mongo up
+
+# Production overrides (resource limits, logging, healthcheck):
+docker compose -f docker-compose.yml -f docker-compose.prod.yml --profile mongo up -d
+```
+
+### Cloud Workflow for a Multi-Agent System
+
+**Step 1 — Deploy agentns** (once, on any server):
+
+```bash
+# EC2, GCP VM, Azure VM — pick one
+export MONGODB_URI="mongodb+srv://user:pass@cluster.mongodb.net/"
+docker run -d --restart always -p 8200:8200 \
+  -e MONGODB_URI="$MONGODB_URI" \
+  ghcr.io/tonystark3110/agentns:latest
+# Note your server's public IP, open port 8200
+```
+
+**Step 2 — Configure every agent**:
+
+```bash
+# Set on each agent's server/container/Lambda
+AGENTNS_URL=http://your-agentns-server-ip:8200
+```
+
+**Step 3 — Register at agent startup**:
+
+```python
+import agentns, os
+
+client = agentns.target_lib.connect()
+await client.record(agentns.DeploymentSpec(
+    leaf_name  = "alerts",
+    a2a_url    = f"http://{os.environ['MY_PUBLIC_IP']}:9001",
+    health_url = f"http://{os.environ['MY_PUBLIC_IP']}:9001/health",
+    region     = "us-east",
+    location   = {"city": "Boston"},
+    protocols  = ["A2A"],
+))
+```
+
+**Step 4a — Call through the proxy** (simplest, recommended):
+
+```python
+import httpx, os
+
+resp = await httpx.AsyncClient().post(
+    f"http://{os.environ['AGENTNS_URL']}/proxy/alerts",
+    json={"method": "message/send", "params": {"text": "hello"}}
+)
+```
+
+No need to know the real endpoint. agentns handles health-aware routing automatically.
+
+**Step 4b — Resolve first, then call directly** (lower latency for high-frequency calls):
+
+```python
+import agentns
+
+client   = agentns.requester_lib.connect()
+endpoint = await client.resolve(agentns.Query.from_label("alerts"))
+if endpoint:
+    resp = await httpx.AsyncClient().post(endpoint.url, json={...})
+```
+
+Cache hit latency < 1 ms. Use this pattern for hot paths.
+
+---
+
+## 15. Development Guide
+
+### Setup
+
+```bash
+git clone https://github.com/tonystark3110/agentns
+cd agentns
+python -m venv .venv && source .venv/bin/activate  # Windows: .venv\Scripts\activate
+pip install -e ".[dev]"
+```
+
+### Running Tests
+
+```bash
+pytest tests/ -v
+pytest tests/ -v --tb=short   # compact output
+pytest tests/test_api.py -k "proxy"  # filter by name
+```
+
+Tests use `httpx.AsyncClient(transport=ASGITransport(app=app))` — no real network, no external services needed.
+
+### Test Structure
+
+```
+tests/
+├── conftest.py          — pytest config (minimal)
+└── test_api.py          — integration tests for all HTTP endpoints
+```
+
+Each test:
+1. Clears `_registry`, `_health_cache`, `_cache` via the `clear_state` autouse fixture
+2. Gets a fresh `client` fixture (in-process ASGI transport)
+3. Makes HTTP calls against the real FastAPI app
+
+### Adding Tests
+
+```python
+@pytest.mark.asyncio
+async def test_my_feature(client):
+    # Register an endpoint
+    await client.post("/register", json={"label": "myagent", "endpoint": "http://host:9001"})
+
+    # Inject health status (avoids real network calls in tests)
+    _health_cache["http://host:9001"] = {
+        "status": "healthy", "load": 10.0, "response_time_ms": 20.0, "last_check": "now"
+    }
+
+    # Test your feature
+    resp = await client.post("/resolve", json={"label": "myagent"})
+    assert resp.status_code == 200
+    assert resp.json()["endpoint"] == "http://host:9001"
+```
+
+### GitHub Actions / CI
+
+`.github/workflows/docker-publish.yml` builds and pushes to GHCR on every push to `main`.
+
+Required steps:
+1. `docker/setup-buildx-action@v3` — required by `build-push-action@v5`
+2. `docker/login-action@v3` — authenticates to GHCR using `GITHUB_TOKEN`
+3. `docker/build-push-action@v5` — builds multi-platform image
+
+### Release Checklist
+
+1. Bump version in `pyproject.toml` and `server.py` (`__version__`)
+2. Update `TECHNICAL.md` version number
+3. Run `pytest tests/ -v` — all must pass
+4. `git tag v3.x.x && git push origin v3.x.x`
+5. GitHub Actions builds and pushes `ghcr.io/tonystark3110/agentns:v3.x.x` and `:latest`
+
+---
+
+*Technical Reference — agentns v3.0.0 — MIT License*
