@@ -208,6 +208,55 @@ Flush the resolution cache.
 
 ---
 
+## Federation (multi-registry)
+
+Each agentns instance owns a **TLD** (e.g. `mbta.local`, `hospital.local`). Instances can be linked together — when a resolve request arrives for a URN whose TLD belongs to another registry, agentns automatically forwards it there.
+
+```
+urn:hospital.local:er:triage
+        │
+        └─► agentns (mbta.local) has no agents for hospital.local
+               └─► forward to → agentns (hospital.local)
+                                  └─► resolve locally → return endpoint
+```
+
+### Wire up remote registries at startup
+
+```bash
+# Instance A — owns mbta.local, knows about hospital.local
+AGENTNS_TLD=mbta.local \
+FEDERATION_REGISTRIES='{"hospital.local":"http://hospital-agentns:8200"}' \
+agentns-server
+
+# Or CSV format:
+FEDERATION_REGISTRIES=hospital.local=http://hospital-agentns:8200,payments.local=http://payments:8200
+```
+
+### Manage federation at runtime (no restart)
+
+```bash
+# Register a new remote
+curl -X POST http://localhost:8200/switchboard/registries \
+  -H "Content-Type: application/json" \
+  -d '{"tld": "hospital.local", "url": "http://hospital-agentns:8200"}'
+
+# List all connected registries
+curl http://localhost:8200/switchboard/registries
+
+# Remove a remote
+curl -X DELETE http://localhost:8200/switchboard/registries/hospital.local
+```
+
+### Cross-registry resolve — transparent to callers
+
+```bash
+# This resolves on the hospital.local instance, even if called against mbta.local:
+curl -X POST http://localhost:8200/resolve \
+  -d '{"agent_name": "urn:hospital.local:er:triage"}'
+```
+
+---
+
 ## MongoDB persistence
 
 By default the registry lives in memory — fast, zero setup, but lost on restart.
@@ -431,9 +480,10 @@ urn:{tld}:{namespace}:{label}
 |---|---|---|
 | `AGENTNS_PORT` | `8200` | HTTP port |
 | `AGENTNS_NAMESPACE` | `agents.local` | Default URN namespace |
-| `AGENTNS_TLD` | `agentns.local` | URN top-level domain |
+| `AGENTNS_TLD` | `agentns.local` | TLD this instance owns (e.g. `mbta.local`) |
 | `AGENTNS_HEALTH_INTERVAL` | `30` | Background health sweep interval (s) |
 | `AGENTNS_GEOCODING` | `on` | Set `off` to disable Nominatim geocoding |
+| `FEDERATION_REGISTRIES` | *(none)* | Remote registries: JSON `{"tld":"url"}` or CSV `tld=url,tld=url` |
 | `MONGODB_URI` | *(none)* | MongoDB URI — in-memory if absent |
 | `MONGODB_DB` | `agentns` | MongoDB database name |
 | `AGENTNS_PROXY_HOST` | *(none)* | Agentgateway hostname |

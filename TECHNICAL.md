@@ -40,6 +40,7 @@
 13. [Performance Characteristics](#13-performance-characteristics)
 14. [Deployment Guide](#14-deployment-guide)
 15. [Development Guide](#15-development-guide)
+16. [Switchboard / Federation](#16-switchboard--federation)
 
 ---
 
@@ -1349,8 +1350,7 @@ Also accepts `"agent_name"` (URN) in place of `"label"`.
 ```
 
 **Response 400:** No `agent_name` or `label` provided.  
-**Response 403:** URN TLD or namespace doesn't match this server.  
-**Response 404:** Label not registered.
+**Response 404:** Label not registered, or URN TLD has no registered remote registry.
 
 ---
 
@@ -1378,6 +1378,73 @@ curl -X DELETE http://localhost:8200/register/emailer
 
 ---
 
+### `GET /switchboard/registries`
+
+List all connected registries (local + all remotes).
+
+```json
+{
+  "local": {
+    "tld": "mbta.local",
+    "namespace": "transit",
+    "total_labels": 5,
+    "total_endpoints": 8
+  },
+  "remotes": [
+    {
+      "tld": "hospital.local",
+      "url": "http://hospital-agentns:8200",
+      "registry_id": "hospital.local",
+      "status": "reachable",
+      "added_at": "2025-05-07T10:00:00Z"
+    }
+  ],
+  "count": 1
+}
+```
+
+---
+
+### `POST /switchboard/registries`
+
+Register a remote registry at runtime.
+
+**Request body:**
+```json
+{
+  "tld":  "hospital.local",
+  "url":  "http://hospital-agentns:8200"
+}
+```
+
+Both fields are required. agentns probes the remote's `/health` endpoint to confirm it is reachable.
+
+**Response 200:**
+```json
+{"status": "registered", "tld": "hospital.local", "url": "http://hospital-agentns:8200", "reachable": true}
+```
+
+**Response 400:** `tld` or `url` missing.
+
+---
+
+### `DELETE /switchboard/registries/{tld}`
+
+Remove a remote registry.
+
+```bash
+curl -X DELETE http://localhost:8200/switchboard/registries/hospital.local
+```
+
+**Response 200:**
+```json
+{"status": "removed", "tld": "hospital.local"}
+```
+
+**Response 404:** TLD not found in federation table.
+
+---
+
 ### `GET /health`
 
 Full server health report. Always returns HTTP 200.
@@ -1395,6 +1462,11 @@ Full server health report. Always returns HTTP 200.
     "mode": "agentgateway",
     "endpoint": "http://agentgateway:8400",
     "slim_org": ""
+  },
+  "switchboard": {
+    "enabled": true,
+    "remote_registries": 2,
+    "tlds": ["hospital.local", "payments.local"]
   },
   "agents": {
     "emailer": [
@@ -1443,9 +1515,27 @@ All configuration is via environment variables. No config files, no hardcoded va
 |----------|---------|-------------|
 | `AGENTNS_PORT` | `8200` | HTTP port |
 | `AGENTNS_NAMESPACE` | `agents.local` | Default URN namespace for new registrations |
-| `AGENTNS_TLD` | `agentns.local` | URN TLD used in `agent_name` construction |
+| `AGENTNS_TLD` | `agentns.local` | URN TLD this instance owns (e.g. `mbta.local`) |
 | `AGENTNS_HEALTH_INTERVAL` | `30` | Seconds between background health sweeps |
 | `AGENTNS_GEOCODING` | `on` | Set `off` to disable Nominatim geocoding |
+
+### Federation / Switchboard Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `FEDERATION_REGISTRIES` | *(none)* | Remote registries to wire at startup. JSON `{"tld":"url"}` or CSV `tld=url,tld=url` |
+
+**JSON format example:**
+```bash
+FEDERATION_REGISTRIES='{"hospital.local":"http://hospital:8200","payments.local":"http://payments:8200"}'
+```
+
+**CSV format example:**
+```bash
+FEDERATION_REGISTRIES=hospital.local=http://hospital:8200,payments.local=http://payments:8200
+```
+
+Remote registries can also be added/removed at runtime via `POST/DELETE /switchboard/registries` without restarting.
 
 ### MongoDB Variables
 
@@ -1512,8 +1602,7 @@ Every code path returns a response rather than propagating an unhandled exceptio
 |------|------|
 | 200 | All success cases, including emergency_fallback |
 | 400 | Missing required fields |
-| 403 | URN TLD or namespace mismatch |
-| 404 | Label not registered (resolve / deregister) |
+| 404 | Label not registered; URN TLD has no registered federation remote |
 | 502 | Proxy: upstream refused connection |
 | 504 | Proxy: upstream timed out |
 
@@ -1726,6 +1815,131 @@ Required steps:
 3. Run `pytest tests/ -v` — all must pass
 4. `git tag v3.x.x && git push origin v3.x.x`
 5. GitHub Actions builds and pushes `ghcr.io/tonystark3110/agentns:v3.x.x` and `:latest`
+
+---
+
+## 16. Switchboard / Federation
+
+### Overview
+
+Each agentns instance **owns a TLD**. When a `/resolve` request arrives for a URN whose TLD belongs to a different registry, the request is automatically forwarded to the correct remote instance — transparent to the caller.
+
+```
+Client                     agentns A (mbta.local)        agentns B (hospital.local)
+──────                     ───────────────────────        ──────────────────────────
+POST /resolve
+{"agent_name":
+ "urn:hospital.local
+  :er:triage"}
+                      ─────────────────────────►
+                           TLD = hospital.local
+                           Not owned locally
+                           → forward to remote B
+                                                    ─────────────────────────────────►
+                                                          local resolve
+                                                    ◄─────────────────────────────────
+                           tag: federated_from=B
+                      ◄─────────────────────────
+         {
+           "endpoint": "http://er-triage:9001",
+           "federated_from": "http://hospital-agentns:8200"
+         }
+```
+
+### Data Structures
+
+```python
+_federation: Dict[str, Dict] = {}
+```
+
+Module-level dict. Maps TLD → remote registry metadata:
+
+```python
+_federation["hospital.local"] = {
+    "url":         "http://hospital-agentns:8200",
+    "registry_id": "hospital.local",
+    "status":      "reachable",
+    "added_at":    "2025-05-07T10:00:00Z",
+}
+```
+
+### Startup Loading
+
+`_load_federation_from_env()` is called at import time. It reads `FEDERATION_REGISTRIES` and populates `_federation` before the first HTTP request arrives.
+
+```python
+# Supported formats:
+# JSON:
+FEDERATION_REGISTRIES='{"hospital.local":"http://hospital:8200"}'
+
+# CSV:
+FEDERATION_REGISTRIES=hospital.local=http://hospital:8200,payments.local=http://payments:8200
+```
+
+### Resolve Routing Logic
+
+In `POST /resolve`, after parsing the URN:
+
+```python
+if parsed.tld and parsed.tld != DEFAULT_TLD:
+    remote = _federation.get(parsed.tld)
+    if remote:
+        # Proxy request to the registry that owns this TLD
+        return await _federated_resolve(remote["url"], body)
+    # No remote owns this TLD → 404
+    raise HTTPException(404, f"No registry is registered for TLD '{parsed.tld}'...")
+```
+
+**Key behaviour:**
+- TLD matches local `AGENTNS_TLD` → resolve locally (any namespace valid)
+- TLD found in `_federation` → forward to that remote transparently
+- TLD unknown → `404 No registry registered for TLD '...'`
+- Namespace is **never validated** — multiple namespaces are valid within one registry
+
+### `_federated_resolve(remote_url, body)` (async)
+
+Shared `_proxy_client` (created in lifespan, closed on shutdown) posts the request body to `{remote_url}/resolve`. The result is tagged with `"federated_from": remote_url` before returning to the caller.
+
+Using a shared client eliminates TCP/TLS overhead — no new connection is established per proxy hop.
+
+### Switchboard Endpoints
+
+#### `GET /switchboard/registries`
+
+Lists the local registry summary plus all entries in `_federation`.
+
+#### `POST /switchboard/registries`
+
+Adds a new remote. Probes `{url}/health` before accepting the registration. Returns `"reachable": true/false` based on probe result. Does **not** reject the registration if unreachable — the remote may come up later.
+
+#### `DELETE /switchboard/registries/{tld}`
+
+Removes a TLD entry from `_federation`. Subsequent resolves for that TLD will return 404.
+
+### Multi-Registry Deployment Example
+
+```
+                    ┌─────────────────────────────────┐
+                    │   Central Gateway                │
+                    │   AGENTNS_TLD=gateway.local      │
+                    │                                  │
+                    │   FEDERATION_REGISTRIES=         │
+                    │   mbta.local=http://mbta:8200,   │
+                    │   hospital.local=http://hosp:8200│
+                    └──────────────┬──────────────────┘
+                                   │ forwards based on TLD
+                    ┌──────────────┴──────────────────┐
+                    │                                  │
+          ┌─────────┴──────────┐         ┌────────────┴───────────┐
+          │  agentns (MBTA)    │         │  agentns (Hospital)    │
+          │  AGENTNS_TLD=      │         │  AGENTNS_TLD=          │
+          │    mbta.local      │         │    hospital.local      │
+          │  agents: rider,    │         │  agents: triage,       │
+          │    planner, alerts │         │    lab, pharmacy       │
+          └────────────────────┘         └────────────────────────┘
+```
+
+Each team runs their own agentns with their own TLD. Agents from any team can resolve agents in any other team using the full URN — the gateway instance forwards transparently.
 
 ---
 
