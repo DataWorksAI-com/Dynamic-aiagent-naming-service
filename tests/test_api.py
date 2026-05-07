@@ -99,23 +99,31 @@ async def test_resolve_by_urn(client):
 
 
 @pytest.mark.asyncio
-async def test_resolve_wrong_tld_rejected(client):
-    """URN with a different TLD should be rejected — wrong nameserver."""
+async def test_resolve_unknown_tld_no_federation(client):
+    """URN with a TLD that has no registered remote registry returns 404."""
     resp = await client.post("/resolve", json={
         "agent_name": "urn:wrong.com:agents.local:emailer"
     })
-    assert resp.status_code == 403
-    assert "wrong nameserver" in resp.json()["detail"]
+    assert resp.status_code == 404
+    assert "No registry" in resp.json()["detail"]
 
 
 @pytest.mark.asyncio
-async def test_resolve_wrong_namespace_rejected(client):
-    """URN with correct TLD but wrong namespace should be rejected."""
+async def test_resolve_different_namespace_same_tld(client):
+    """URN with correct TLD but a different namespace resolves normally (no namespace check)."""
+    # Register with any label; namespace in URN is not validated locally
+    await client.post("/register", json={
+        "label": "emailer",
+        "endpoint": "http://test-other:9001"
+    })
+    _health_cache["http://test-other:9001"] = {
+        "status": "healthy", "load": 30.0, "response_time_ms": 50.0, "last_check": "now"
+    }
     resp = await client.post("/resolve", json={
         "agent_name": "urn:agentns.local:other-app:emailer"
     })
-    assert resp.status_code == 403
-    assert "namespace" in resp.json()["detail"]
+    assert resp.status_code == 200
+    assert resp.json()["endpoint"] == "http://test-other:9001"
 
 
 @pytest.mark.asyncio

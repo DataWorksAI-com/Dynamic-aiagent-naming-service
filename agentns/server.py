@@ -1,7 +1,7 @@
 """
 agentns.server
 ==============
-Single-binary Agent Name Service sidecar.
+Single-binary Agent Name Service sidecar with built-in switchboard federation.
 
 Combines all three resolution hops into one process:
 
@@ -18,14 +18,36 @@ Any agent framework in any language calls the HTTP API:
     POST   /cache/clear
     GET    /cache/stats
 
+    GET    /switchboard/registries           list this + all connected registries
+    POST   /switchboard/registries           connect a remote registry  {tld, url}
+    DELETE /switchboard/registries/{tld}     disconnect a remote registry
+
+Multi-registry federation (Switchboard)
+----------------------------------------
+Each agentns instance owns a TLD (AGENTNS_TLD). When a /resolve request arrives
+for a URN whose TLD belongs to a different registry, agentns looks up the
+federation map and forwards the request to the correct remote instance.
+
+    Registry A  (TLD=payments.acme.io)    Registry B  (TLD=alerts.acme.io)
+         ↑                                      ↑
+         └──── both registered in ─────────────┘
+                    Switchboard registry
+                    (knows TLD→URL mapping)
+
+    POST /resolve {"agent_name": "urn:alerts.acme.io:prod:emailer"}
+         → Switchboard sees TLD=alerts.acme.io → routes to Registry B → returns result
+
 Configuration (environment variables — zero hardcoded values)
 -------------------------------------------------------------
     AGENTNS_PORT              HTTP port            (default: 8200)
     AGENTNS_NAMESPACE         Default URN namespace (default: "agents.local")
-    AGENTNS_TLD               URN TLD              (default: "agentns.local")
+    AGENTNS_TLD               URN TLD this instance owns (default: "agentns.local")
     AGENTNS_HEALTH_INTERVAL   Background health sweep interval in s  (default: 30)
     MONGODB_URI               MongoDB connection string (optional; in-memory if absent)
     MONGODB_DB                MongoDB database name    (default: "agentns")
+    FEDERATION_REGISTRIES     Remote registries to connect at startup.
+                              JSON:  '{"payments.io":"http://pay:8200","alerts.io":"http://a:8200"}'
+                              CSV:   payments.io=http://pay:8200,alerts.io=http://a:8200
 """
 
 from __future__ import annotations
@@ -123,6 +145,42 @@ else:
     _PROXY_ENDPOINTS = []
 
 _start_time = _time.time()
+
+# ── Federation / Switchboard ───────────────────────────────────────────────────
+# Maps TLD → {url, registry_id, status, added_at}
+# Each entry is a remote agentns instance that owns agents under that TLD.
+# Populated from FEDERATION_REGISTRIES env var at startup, and managed at
+# runtime via POST/DELETE /switchboard/registries.
+_federation: Dict[str, Dict] = {}
+
+
+def _load_federation_from_env() -> None:
+    """Parse FEDERATION_REGISTRIES env var into _federation at startup."""
+    raw = os.getenv("FEDERATION_REGISTRIES", "").strip()
+    if not raw:
+        return
+    entries: Dict[str, str] = {}
+    try:
+        entries = json.loads(raw)                       # JSON format preferred
+    except json.JSONDecodeError:
+        for pair in raw.split(","):                     # CSV fallback: tld=url,...
+            pair = pair.strip()
+            if "=" in pair:
+                tld, url = pair.split("=", 1)
+                entries[tld.strip()] = url.strip()
+    for tld, url in entries.items():
+        _federation[tld.strip()] = {
+            "url":         url.strip().rstrip("/"),
+            "registry_id": tld.strip(),
+            "status":      "configured",
+            "added_at":    "startup",
+        }
+    if _federation:
+        logger.info(f"Federation: {len(_federation)} remote registr(ies) loaded: {list(_federation)}")
+
+
+# Load federation at import time (sync — just dict operations)
+_load_federation_from_env()
 
 # ── in-memory registry ─────────────────────────────────────────────────────────
 # { label -> [endpoint_dict, ...] }
@@ -271,6 +329,8 @@ async def lifespan(application: FastAPI):
     logger.info(f"agentns ready — {total} endpoint(s) across {len(_registry)} label(s) | port {PORT}")
     if _PROXY_ENDPOINTS:
         logger.info(f"A2A proxy enabled — mode={_PROXY_MODE} endpoint={_PROXY_ENDPOINTS[0]}")
+    if _federation:
+        logger.info(f"Switchboard active — {len(_federation)} remote registr(ies): {list(_federation)}")
 
     yield
 
@@ -343,6 +403,38 @@ def _build_proxy_response(result: Dict, label: str, namespace: str) -> Dict:
     return result
 
 
+# ── Federation helper ─────────────────────────────────────────────────────────
+
+async def _federated_resolve(remote_url: str, body: Dict) -> Dict:
+    """
+    Forward a /resolve request to a remote agentns instance.
+
+    The original body is passed through unchanged so requester_context
+    (location, protocols) is preserved end-to-end.
+    """
+    try:
+        resp = await _proxy_client.post(
+            f"{remote_url}/resolve",
+            json=body,
+            timeout=httpx.Timeout(connect=3.0, read=10.0, write=5.0, pool=3.0),
+        )
+        if resp.status_code == 200:
+            result = resp.json()
+            result["federated_from"] = remote_url   # tag so caller knows it came from federation
+            return result
+        # Propagate remote errors (404 = not found there either, etc.)
+        detail = resp.text[:300] if resp.text else f"HTTP {resp.status_code}"
+        raise HTTPException(status_code=resp.status_code, detail=f"[{remote_url}] {detail}")
+    except HTTPException:
+        raise
+    except httpx.ConnectError:
+        raise HTTPException(502, f"Could not reach remote registry at {remote_url}")
+    except httpx.TimeoutException:
+        raise HTTPException(504, f"Remote registry at {remote_url} timed out")
+    except Exception as exc:
+        raise HTTPException(502, f"Federation error forwarding to {remote_url}: {exc}")
+
+
 # ── POST /resolve ──────────────────────────────────────────────────────────────
 
 @app.post("/resolve")
@@ -369,34 +461,26 @@ async def resolve(request: Request, body: dict):
     if agent_name:
         parsed = parse_urn(agent_name)
 
-        # ── Namespace validation ───────────────────────────────────────────────
-        # If the URN contains a TLD or namespace, they must match this instance.
-        # This makes agentns behave like DNS — it only answers for its own domain.
+        # ── TLD routing ───────────────────────────────────────────────────────
+        # If the URN's TLD doesn't match this instance, route via federation.
+        # Multiple namespaces are allowed within one instance — no namespace check.
         #
-        # Examples (DEFAULT_TLD="agents.dataworksai.com", DEFAULT_NS="mbta-transit-ci"):
-        #
-        #   urn:agents.dataworksai.com:mbta-transit-ci:alerts  → OK
-        #   urn:agents.dataworksai.com:alerts                  → OK (namespace omitted)
-        #   urn:wrong.com:mbta-transit-ci:alerts               → 403 wrong TLD
-        #   urn:agents.dataworksai.com:other-app:alerts        → 403 wrong namespace
-        #   alerts                                             → OK (plain label, no check)
-
+        #   urn:this-tld:any-namespace:label  → resolve locally (any namespace OK)
+        #   urn:other-tld:ns:label            → forward to the registry that owns other-tld
+        #   label  (no TLD)                   → resolve locally
         if parsed.tld and parsed.tld != DEFAULT_TLD:
+            remote = _federation.get(parsed.tld)
+            if remote:
+                logger.info(
+                    f"Federation: routing urn:{parsed.tld}:... → {remote['url']}"
+                )
+                return await _federated_resolve(remote["url"], body)
             raise HTTPException(
-                status_code=403,
+                status_code=404,
                 detail=(
-                    f"This agentns instance handles TLD '{DEFAULT_TLD}', "
-                    f"not '{parsed.tld}'. You are asking the wrong nameserver."
-                ),
-            )
-
-        if parsed.namespace and parsed.namespace != DEFAULT_NS:
-            raise HTTPException(
-                status_code=403,
-                detail=(
-                    f"This agentns instance handles namespace '{DEFAULT_NS}', "
-                    f"not '{parsed.namespace}'. "
-                    f"Register agents under the correct namespace or update AGENTNS_NAMESPACE."
+                    f"No registry is registered for TLD '{parsed.tld}'. "
+                    f"This instance owns '{DEFAULT_TLD}'. "
+                    f"Add the remote registry via POST /switchboard/registries."
                 ),
             )
 
@@ -725,6 +809,11 @@ async def health():
             "endpoint": _PROXY_ENDPOINTS[0] if _PROXY_ENDPOINTS else None,
             "slim_org": SLIM_ORG or None,
         },
+        "switchboard": {
+            "enabled":            bool(_federation),
+            "remote_registries":  len(_federation),
+            "tlds":               list(_federation.keys()),
+        },
         "agents": agents_status,
     }
     # Only include geocoded_cities when at least one city has been resolved
@@ -785,6 +874,106 @@ async def cache_stats():
 async def cache_clear(request: Request):
     count = await _cache.clear()
     return {"status": "cleared", "entries_removed": count}
+
+
+# ── Switchboard endpoints ─────────────────────────────────────────────────────
+
+@app.get("/switchboard/registries")
+async def switchboard_list():
+    """
+    List this registry and every connected remote registry.
+
+    The first entry is always this local instance. Remaining entries are
+    remote agentns instances registered via POST /switchboard/registries or
+    FEDERATION_REGISTRIES env var.
+    """
+    registries = [
+        {
+            "registry_id": DEFAULT_TLD,
+            "tld":         DEFAULT_TLD,
+            "namespace":   DEFAULT_NS,
+            "url":         f"http://localhost:{PORT}",
+            "type":        "local",
+            "status":      "active",
+            "labels":      len(_registry),
+            "endpoints":   sum(len(v) for v in _registry.values()),
+        }
+    ]
+    for tld, info in _federation.items():
+        registries.append({
+            "registry_id": info["registry_id"],
+            "tld":         tld,
+            "url":         info["url"],
+            "type":        "remote",
+            "status":      info.get("status", "configured"),
+            "added_at":    info.get("added_at"),
+        })
+    return {"registries": registries, "count": len(registries)}
+
+
+@app.post("/switchboard/registries")
+async def switchboard_register(body: dict):
+    """
+    Connect a remote agentns instance to the switchboard.
+
+    Required fields:
+        tld  — the TLD the remote registry owns  e.g. "payments.acme.io"
+        url  — base URL of the remote instance   e.g. "http://payments-agentns:8200"
+
+    Optional:
+        registry_id — human-readable label (defaults to tld)
+
+    After registering, /resolve requests for URNs whose TLD matches will be
+    automatically forwarded to the remote registry.
+    """
+    tld = (body.get("tld") or "").strip()
+    url = (body.get("url") or "").strip().rstrip("/")
+    if not tld or not url:
+        raise HTTPException(400, "'tld' and 'url' are required")
+    if tld == DEFAULT_TLD:
+        raise HTTPException(400, f"'{tld}' is this instance's own TLD — cannot register as remote")
+
+    registry_id = (body.get("registry_id") or tld).strip()
+
+    # Probe the remote to confirm it's reachable and report its status
+    remote_status = "unreachable"
+    try:
+        resp = await _proxy_client.get(
+            f"{url}/health",
+            timeout=httpx.Timeout(connect=3.0, read=5.0, write=5.0, pool=3.0),
+        )
+        remote_status = "active" if resp.status_code == 200 else f"http_{resp.status_code}"
+    except Exception:
+        pass  # unreachable — still register; it may come up later
+
+    _federation[tld] = {
+        "url":         url,
+        "registry_id": registry_id,
+        "status":      remote_status,
+        "added_at":    datetime.now(timezone.utc).isoformat(),
+    }
+    logger.info(f"Switchboard: registered tld={tld!r} url={url!r} status={remote_status}")
+    return {
+        "status":        "registered",
+        "tld":           tld,
+        "url":           url,
+        "registry_id":   registry_id,
+        "remote_status": remote_status,
+    }
+
+
+@app.delete("/switchboard/registries/{tld:path}")
+async def switchboard_deregister(tld: str):
+    """
+    Disconnect a remote registry from the switchboard.
+
+    After removal, /resolve for that TLD returns 404 instead of routing.
+    """
+    if tld not in _federation:
+        raise HTTPException(404, f"No remote registry registered for TLD '{tld}'")
+    _federation.pop(tld)
+    logger.info(f"Switchboard: removed remote registry tld={tld!r}")
+    return {"status": "removed", "tld": tld}
 
 
 # ── proxy helpers ─────────────────────────────────────────────────────────────
@@ -967,16 +1156,18 @@ def main() -> None:
         os.environ["AGENTNS_NAMESPACE"] = args.namespace
 
     _proxy_display = _PROXY_ENDPOINTS[0] if _PROXY_ENDPOINTS else "disabled"
+    _fed_display   = f"{len(_federation)} registr(ies): {list(_federation)}" if _federation else "disabled"
     print(f"""
 ╔══════════════════════════════════════════════╗
 ║          agentns  v3.0.0  starting           ║
 ╚══════════════════════════════════════════════╝
-  Port      : {args.port}
-  Namespace : {args.namespace}
-  TLD       : {DEFAULT_TLD}
-  MongoDB   : {'connected' if MONGODB_URI else 'disabled (in-memory)'}
-  Health    : every {HEALTH_INTERVAL}s
-  Proxy     : {_proxy_display}
+  Port         : {args.port}
+  TLD          : {DEFAULT_TLD}
+  Namespace    : {args.namespace}
+  MongoDB      : {'enabled' if MONGODB_URI else 'disabled (in-memory)'}
+  Health       : every {HEALTH_INTERVAL}s
+  Proxy        : {_proxy_display}
+  Switchboard  : {_fed_display}
 """)
     uvicorn.run(
         "agentns.server:app",
