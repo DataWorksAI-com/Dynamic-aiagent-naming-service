@@ -303,17 +303,22 @@ class RequesterAgentClient:
         api_key: str = "",
     ):
         self.resolver_url = resolver_url.rstrip("/")
-        self.timeout      = timeout
-        self._headers: Dict[str, str] = {"Content-Type": "application/json"}
+        headers: Dict[str, str] = {"Content-Type": "application/json"}
         if api_key:
-            self._headers["X-API-Key"] = api_key
+            headers["X-API-Key"] = api_key
+        # Persistent client — reuses TCP connections across resolve() calls.
+        self._client = httpx.AsyncClient(
+            timeout=timeout,
+            headers=headers,
+            limits=httpx.Limits(max_connections=10, max_keepalive_connections=5),
+        )
 
     async def resolve(self, query: Query) -> Optional[TailoredEndpoint]:
         """
         Resolve the agent named in ``query`` to a live endpoint.
 
         Returns TailoredEndpoint on success, None on any failure (network error,
-        agent not found, auth failure, resolver down, etc.).
+        agent not found, resolver down, etc.).
 
         Never raises.
         """
@@ -325,8 +330,7 @@ class RequesterAgentClient:
             payload["requester_context"] = query.requester_context.to_dict()
 
         try:
-            async with httpx.AsyncClient(timeout=self.timeout, headers=self._headers) as client:
-                resp = await client.post(f"{self.resolver_url}/resolve", json=payload)
+            resp = await self._client.post(f"{self.resolver_url}/resolve", json=payload)
             if resp.status_code != 200:
                 return None
             data = resp.json()
@@ -347,14 +351,17 @@ class RequesterAgentClient:
             return None
 
     async def health(self) -> Dict:
-        """Check the resolver's own health. Does not require authentication."""
+        """Check the resolver's own health."""
         try:
-            async with httpx.AsyncClient(timeout=self.timeout) as client:
-                resp = await client.get(f"{self.resolver_url}/health")
-                resp.raise_for_status()
-                return resp.json()
+            resp = await self._client.get(f"{self.resolver_url}/health")
+            resp.raise_for_status()
+            return resp.json()
         except Exception as exc:
             return {"status": "error", "error": str(exc)}
+
+    async def aclose(self) -> None:
+        """Close the underlying HTTP client. Call on agent shutdown."""
+        await self._client.aclose()
 
 
 # ── connect() factory ──────────────────────────────────────────────────────────

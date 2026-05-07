@@ -33,7 +33,7 @@ FROM python:3.12-slim
 
 LABEL org.opencontainers.image.title="agentns"
 LABEL org.opencontainers.image.description="Agent Name Service sidecar for multi-agent systems"
-LABEL org.opencontainers.image.version="2.0.0"
+LABEL org.opencontainers.image.version="3.0.0"
 LABEL org.opencontainers.image.licenses="MIT"
 LABEL org.opencontainers.image.source="https://github.com/tonystark3110/agentns"
 

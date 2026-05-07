@@ -31,9 +31,9 @@ from typing import Dict, Optional
 
 import httpx
 
-CONNECT_TIMEOUT = float(5)
-READ_TIMEOUT    = float(5)
-SLOW_MS         = float(2000)   # response time above which status becomes "degraded"
+CONNECT_TIMEOUT = 5.0
+READ_TIMEOUT    = 5.0
+SLOW_MS         = 2000.0   # response time above which status becomes "degraded"
 
 _client: Optional[httpx.AsyncClient] = None
 _client_lock = asyncio.Lock()
@@ -41,10 +41,14 @@ _client_lock = asyncio.Lock()
 
 async def _get_client() -> httpx.AsyncClient:
     global _client
+    # Fast path — no lock needed if the client is already alive (common case).
+    if _client is not None and not _client.is_closed:
+        return _client
+    # Slow path — acquire lock, double-check, then create.
     async with _client_lock:
         if _client is None or _client.is_closed:
             _client = httpx.AsyncClient(
-                timeout=httpx.Timeout(connect=CONNECT_TIMEOUT, read=READ_TIMEOUT, write=5, pool=5),
+                timeout=httpx.Timeout(connect=CONNECT_TIMEOUT, read=READ_TIMEOUT, write=5.0, pool=5.0),
                 follow_redirects=True,
                 limits=httpx.Limits(max_connections=100, max_keepalive_connections=20),
             )

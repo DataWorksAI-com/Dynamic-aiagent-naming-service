@@ -117,11 +117,16 @@ class TargetAgentClient:
         timeout: float = 5.0,
         api_key: str = "",
     ):
-        self.ns_url  = ns_url.rstrip("/")
-        self.timeout = timeout
-        self._headers: Dict[str, str] = {"Content-Type": "application/json"}
+        self.ns_url = ns_url.rstrip("/")
+        headers: Dict[str, str] = {"Content-Type": "application/json"}
         if api_key:
-            self._headers["X-API-Key"] = api_key
+            headers["X-API-Key"] = api_key
+        # Persistent client — reuses TCP connections across record/deregister calls.
+        self._client = httpx.AsyncClient(
+            timeout=timeout,
+            headers=headers,
+            limits=httpx.Limits(max_connections=5, max_keepalive_connections=2),
+        )
 
     # ── record (register) ──────────────────────────────────────────────────────
 
@@ -164,10 +169,9 @@ class TargetAgentClient:
         last_exc: Exception = RuntimeError("record() called with retries=0")
         for attempt in range(1, retries + 1):
             try:
-                async with httpx.AsyncClient(timeout=self.timeout, headers=self._headers) as client:
-                    resp = await client.post(f"{self.ns_url}/register", json=payload)
-                    resp.raise_for_status()
-                    return resp.json()
+                resp = await self._client.post(f"{self.ns_url}/register", json=payload)
+                resp.raise_for_status()
+                return resp.json()
             except Exception as exc:
                 last_exc = exc
                 if attempt < retries:
@@ -198,14 +202,13 @@ class TargetAgentClient:
         """
         # Pass endpoint as a query param — more reliable than DELETE body across proxies
         params = {"endpoint": a2a_url} if a2a_url else {}
-        async with httpx.AsyncClient(timeout=self.timeout, headers=self._headers) as client:
-            resp = await client.request(
-                "DELETE",
-                f"{self.ns_url}/register/{leaf_name}",
-                params=params,
-            )
-            resp.raise_for_status()
-            return resp.json()
+        resp = await self._client.request(
+            "DELETE",
+            f"{self.ns_url}/register/{leaf_name}",
+            params=params,
+        )
+        resp.raise_for_status()
+        return resp.json()
 
     # ── health ────────────────────────────────────────────────────────────────
 
@@ -213,16 +216,18 @@ class TargetAgentClient:
         """
         Check the nameservice's own health.
 
-        Does not require authentication.
         Never raises — returns ``{"status": "error", "error": "..."}`` on failure.
         """
         try:
-            async with httpx.AsyncClient(timeout=self.timeout) as client:
-                resp = await client.get(f"{self.ns_url}/health")
-                resp.raise_for_status()
-                return resp.json()
+            resp = await self._client.get(f"{self.ns_url}/health")
+            resp.raise_for_status()
+            return resp.json()
         except Exception as exc:
             return {"status": "error", "error": str(exc)}
+
+    async def aclose(self) -> None:
+        """Close the underlying HTTP client. Call on agent shutdown."""
+        await self._client.aclose()
 
 
 # ── connect() factory ──────────────────────────────────────────────────────────

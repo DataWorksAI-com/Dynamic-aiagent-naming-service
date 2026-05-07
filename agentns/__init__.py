@@ -49,7 +49,7 @@ Environment variables
     MONGODB_URI              MongoDB connection string     (optional; in-memory if absent)
 """
 
-__version__ = "2.0.0"
+__version__ = "3.0.0"
 __author__  = "DataWorksAI"
 __license__ = "MIT"
 

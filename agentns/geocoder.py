@@ -67,7 +67,7 @@ async def _nominatim_lookup(city: str) -> Optional[Tuple[float, float]]:
             resp = await client.get(
                 NOMINATIM_URL,
                 params={"q": city, "format": "json", "limit": 1},
-                headers={"User-Agent": "agentns/2.0.0 (https://github.com/tonystark3110/agentns)"},
+                headers={"User-Agent": "agentns/3.0.0 (https://github.com/tonystark3110/agentns)"},
             )
         if resp.status_code != 200:
             logger.warning(f"Nominatim returned HTTP {resp.status_code} for '{city}'")

@@ -41,7 +41,7 @@ from typing import Any, Dict, List, Optional
 
 import httpx
 import uvicorn
-from fastapi import FastAPI, HTTPException, Request  # noqa: F401
+from fastapi import FastAPI, HTTPException, Request
 from starlette.responses import Response, StreamingResponse
 
 from .auth             import security_headers_middleware
@@ -128,6 +128,10 @@ _start_time = _time.time()
 # { label -> [endpoint_dict, ...] }
 _registry: Dict[str, List[Dict]] = {}
 
+# ── shared HTTP client for the built-in proxy ──────────────────────────────────
+# Created once in lifespan; reuses TCP connections across requests.
+_proxy_client: Optional[httpx.AsyncClient] = None
+
 # { http_endpoint -> health_dict }
 _health_cache: Dict[str, Dict] = {}
 _health_lock = asyncio.Lock()
@@ -181,7 +185,7 @@ async def _save_to_mongo(label: str, entry: Dict) -> None:
     if _mongo_col is None:
         return
     try:
-        doc = {k: v for k, v in entry.items()}
+        doc = dict(entry)
         doc["label"] = label
         now = datetime.now(timezone.utc)
         await _mongo_col.update_one(
@@ -249,6 +253,15 @@ async def _check_single(endpoint_url: str, hc_url: str) -> None:
 
 @asynccontextmanager
 async def lifespan(application: FastAPI):
+    global _proxy_client
+    # Shared proxy client — created once, reused across all /proxy/* requests.
+    # Separate from the health-checker client (different timeout profile).
+    _proxy_client = httpx.AsyncClient(
+        timeout=httpx.Timeout(connect=5.0, read=60.0, write=10.0, pool=5.0),
+        follow_redirects=False,   # never follow redirects from upstream agents
+        limits=httpx.Limits(max_connections=200, max_keepalive_connections=50),
+    )
+
     await _init_mongo()
     await _load_from_mongo()
     await _check_all()          # initial sweep so first /resolve has real data
@@ -266,6 +279,8 @@ async def lifespan(application: FastAPI):
         await task
     except asyncio.CancelledError:
         pass
+    finally:
+        await _proxy_client.aclose()
 
 
 app = FastAPI(
@@ -277,7 +292,7 @@ app = FastAPI(
         "No authentication required — designed for sidecar/internal network deployments. "
         "For public deployments, place behind a reverse proxy that handles auth at the edge."
     ),
-    version="2.0.0",
+    version="3.0.0",
     lifespan=lifespan,
 )
 
@@ -295,11 +310,6 @@ else:
 
 # ── Proxy helpers ─────────────────────────────────────────────────────────────
 
-def _pick_proxy() -> Optional[str]:
-    """Return the first configured A2A proxy base URL, or None."""
-    return _PROXY_ENDPOINTS[0] if _PROXY_ENDPOINTS else None
-
-
 def _build_proxy_response(result: Dict, label: str, namespace: str) -> Dict:
     """
     Enrich a resolve result with proxy URL and SLIM identity when A2A_PROXY_ENDPOINTS is set.
@@ -314,7 +324,7 @@ def _build_proxy_response(result: Dict, label: str, namespace: str) -> Dict:
         result["slim_identity"] = "my-org/my-namespace/alerts"
         result["metadata"]["direct_endpoint"] = "http://agent-host:9001"       ← preserved
     """
-    proxy_base = _pick_proxy()
+    proxy_base = _PROXY_ENDPOINTS[0] if _PROXY_ENDPOINTS else None
     if not proxy_base:
         result["via_proxy"]     = False
         result["slim_identity"] = ""
@@ -697,30 +707,33 @@ async def health():
     overall = "ok" if "unhealthy" not in all_statuses else "degraded"
 
     geocache = geocode_cache_snapshot()
-    return {
-        "ok":                     overall == "ok",
-        "status":                 overall,
-        "service":                "agentns",
-        "version":                "2.0.0",
-        "namespace":              DEFAULT_NS,
-        "tld":                    DEFAULT_TLD,
-        "mongodb_connected":      _mongo_col is not None,
+    out: Dict[str, Any] = {
+        "ok":                      overall == "ok",
+        "status":                  overall,
+        "service":                 "agentns",
+        "version":                 "3.0.0",
+        "namespace":               DEFAULT_NS,
+        "tld":                     DEFAULT_TLD,
+        "mongodb_connected":       _mongo_col is not None,
         "health_check_interval_s": HEALTH_INTERVAL,
-        "total_labels":           len(_registry),
-        "total_endpoints":        sum(len(v) for v in _registry.values()),
-        "uptime_seconds":         round(_time.time() - _start_time, 1),
+        "total_labels":            len(_registry),
+        "total_endpoints":         sum(len(v) for v in _registry.values()),
+        "uptime_seconds":          round(_time.time() - _start_time, 1),
         "proxy": {
             "enabled":  bool(_PROXY_ENDPOINTS),
             "mode":     _PROXY_MODE if _PROXY_ENDPOINTS else None,
             "endpoint": _PROXY_ENDPOINTS[0] if _PROXY_ENDPOINTS else None,
             "slim_org": SLIM_ORG or None,
         },
-        "geocoded_cities":        {
+        "agents": agents_status,
+    }
+    # Only include geocoded_cities when at least one city has been resolved
+    if geocache:
+        out["geocoded_cities"] = {
             city: {"lat": c[0], "lon": c[1]} if c else "failed"
             for city, c in geocache.items()
-        },
-        "agents":                 agents_status,
-    }
+        }
+    return out
 
 
 # ── GET /agents ────────────────────────────────────────────────────────────────
@@ -850,8 +863,7 @@ async def proxy_agent(request: Request, label: str, path: str = ""):
     # ── 2. A2A agent card — rewrite url to point at this proxy ───────────────
     if path == ".well-known/agent.json":
         try:
-            async with httpx.AsyncClient(timeout=5.0) as c:
-                card_resp = await c.get(target_url)
+            card_resp = await _proxy_client.get(target_url)
             data = card_resp.json()
             proxy_root  = str(request.base_url).rstrip("/")
             data["url"] = f"{proxy_root}/proxy/{label}"
@@ -876,17 +888,15 @@ async def proxy_agent(request: Request, label: str, path: str = ""):
     }
 
     # ── 5. forward and stream the response back ────────────────────────────────
+    # Use the shared _proxy_client — no new client per request (connection reuse).
     try:
-        client = httpx.AsyncClient(
-            timeout=httpx.Timeout(connect=5.0, read=60.0, write=10.0, pool=5.0)
-        )
-        upstream_req = client.build_request(
+        upstream_req = _proxy_client.build_request(
             method  = request.method,
             url     = target_url,
             headers = fwd_headers,
             content = body,
         )
-        upstream = await client.send(upstream_req, stream=True)
+        upstream = await _proxy_client.send(upstream_req, stream=True)
 
         status       = upstream.status_code
         content_type = upstream.headers.get("content-type", "application/octet-stream")
@@ -909,8 +919,7 @@ async def proxy_agent(request: Request, label: str, path: str = ""):
                     async for chunk in upstream.aiter_bytes():
                         yield chunk
                 finally:
-                    await upstream.aclose()
-                    await client.aclose()
+                    await upstream.aclose()   # close response only, NOT the shared client
             return StreamingResponse(
                 _stream_sse(),
                 status_code = status,
@@ -922,14 +931,13 @@ async def proxy_agent(request: Request, label: str, path: str = ""):
         try:
             content = await upstream.aread()
         finally:
-            await upstream.aclose()
-            await client.aclose()
+            await upstream.aclose()   # close response only, NOT the shared client
 
         return Response(
-            content    = content,
+            content     = content,
             status_code = status,
-            headers    = resp_headers,
-            media_type = content_type,
+            headers     = resp_headers,
+            media_type  = content_type,
         )
 
     except httpx.ConnectError:
@@ -961,7 +969,7 @@ def main() -> None:
     _proxy_display = _PROXY_ENDPOINTS[0] if _PROXY_ENDPOINTS else "disabled"
     print(f"""
 ╔══════════════════════════════════════════════╗
-║          agentns  v2.0.0  starting           ║
+║          agentns  v3.0.0  starting           ║
 ╚══════════════════════════════════════════════╝
   Port      : {args.port}
   Namespace : {args.namespace}
